@@ -1,5 +1,5 @@
 #!/bin/bash
-# CUDA_VISIBLE_DEVICES=0,1,2,3 bash eval/video_depth/run_bonn.sh pi3_5T_48f_ft_cam1_local1_global0_chunkloss_roe_gradclip1_xcloud_win12-4_overlap3-1_tttv8_l1_35_multi4_h280_pe3/run_20251102_0934 --num-processes 4 --window-size 48 --overlap-size 3
+# CUDA_VISIBLE_DEVICES=0,1,2,3 bash eval/video_depth/run_bonn.sh LoGeR --num-processes 4 --window-size 48 --overlap-size 3
 
 set -euo pipefail
 
@@ -8,12 +8,11 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 cd "${REPO_ROOT}"
 
 usage() {
-    cat <<'EOF'
-Usage: eval/video_depth/run_bonn.sh <checkpoint_run_path> [options] [datasets...]
+    cat <<'EOF_USAGE'
+Usage: eval/video_depth/run_bonn.sh [ckpt_name] [options] [datasets...]
 
-Required positional arguments:
-  checkpoint_run_path    Remote run identifier used by download_ckpt_gcp.sh,
-                         e.g. pi3_5T_48f_ft_cam1_local1_global0_chunkloss_roe_gradclip1_xcloud_win12-4_overlap3-1_tttv2_l1_35_multi4_h280_pe3/run_20251024_2155
+Optional positional arguments:
+  ckpt_name              Checkpoint name under ckpts/ (default: LoGeR)
 
 Optional flags:
   --datasets list        Comma-separated dataset names (default: bonn_s1_500)
@@ -25,29 +24,26 @@ Optional flags:
   --overlap-size INT     Override Pi3 overlap size
   --num-iterations INT   Override Pi3 decoding iterations
   --causal true|false    Override causal flag
-    --sim3 [true|false]    Override Sim(3) merge flag (default true when provided without value)
-    --sim3_mean [true|false] Override Sim(3) merge flag with trimmed mean scale (default true when provided without value)
-        --se3 [true|false]     Override SE(3) merge flag (default true when provided without value)
-    --pi3x [true|false]    Override Pi3X flag (default true when provided without value)
-    --pi3x-metric [true|false] Override Pi3X Metric flag (default true when provided without value)
-  --epoch19              Use checkpoint_epoch_19.pt instead of latest.pt
+  --sim3 [true|false]    Override Sim(3) merge flag (default true when provided without value)
+  --sim3_mean [true|false] Override Sim(3) merge flag with trimmed mean scale (default true when provided without value)
+  --se3 [true|false]     Override SE(3) merge flag (default true when provided without value)
+  --pi3x [true|false]    Override Pi3X flag (default true when provided without value)
+  --pi3x-metric [true|false] Override Pi3X Metric flag (default true when provided without value)
   --num-processes INT    Accelerate process count (default: 2)
   --port INT             Accelerate main process port (default: 29556)
-  --output-root PATH     Base directory for evaluation outputs (default: ${REPO_ROOT}/eval_results/video_depth)
+  --output-root PATH     Base directory for evaluation outputs (default: ${REPO_ROOT}/eval_results)
   --tag NAME             Sub-directory tag under each dataset (default: pi3)
-    --weights-path PATH    Explicit checkpoint weights file (skip auto-download)
-    --pi3-config PATH      Explicit Pi3 config file (defaults to run's original_config.yaml)
-    --no-pi3-config        Disable Pi3 config loading entirely
-  --skip-download        Assume checkpoint already downloaded
+  --weights-path PATH    Explicit checkpoint weights file (overrides ckpts/<ckpt>/latest.pt)
+  --pi3-config PATH      Explicit Pi3 config file (defaults to ckpts/<ckpt>/original_config.yaml)
+  --no-pi3-config        Disable Pi3 config loading entirely
   -h, --help             Show this message and exit
 
-Datasets can also be provided as additional positional arguments after the checkpoint path.
-If no checkpoint path is specified, defaults to runs/run_pi3.
-EOF
+Datasets can also be provided as additional positional arguments after the checkpoint name.
+EOF_USAGE
 }
 
 CKPT_RUN=""
-DEFAULT_RUN_PATH="runs/run_pi3"
+DEFAULT_CKPT_NAME="LoGeR"
 DATASETS=()
 SIZE=512
 REVISIT=1
@@ -67,13 +63,10 @@ MAIN_PORT=29556
 OUTPUT_ROOT=""
 OUTPUT_ROOT_SPECIFIED=0
 TAG="pi3"
-SKIP_DOWNLOAD=0
 WEIGHTS_PATH=""
 PI3_CONFIG=""
 PI3_CONFIG_SPECIFIED=0
 PI3_CONFIG_ENABLED=1
-IS_HF_MODEL=0
-EPOCH19=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -137,8 +130,6 @@ while [[ $# -gt 0 ]]; do
                 PI3X_METRIC_OVERRIDE="true"
                 shift
             fi ;;
-        --epoch19)
-            EPOCH19=1; shift ;;
         --num-processes)
             NUM_PROCESSES="$2"; shift 2 ;;
         --port)
@@ -153,8 +144,6 @@ while [[ $# -gt 0 ]]; do
             PI3_CONFIG="$2"; PI3_CONFIG_SPECIFIED=1; shift 2 ;;
         --no-pi3-config)
             PI3_CONFIG_ENABLED=0; PI3_CONFIG=""; PI3_CONFIG_SPECIFIED=0; shift ;;
-        --skip-download)
-            SKIP_DOWNLOAD=1; shift ;;
         -h|--help)
             usage; exit 0 ;;
         --)
@@ -170,17 +159,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$CKPT_RUN" ]]; then
-    CKPT_RUN="$DEFAULT_RUN_PATH"
+    CKPT_RUN="$DEFAULT_CKPT_NAME"
     echo "No checkpoint specified; defaulting to ${CKPT_RUN}."
 fi
 
-# Derive run identifier (e.g., run_20251024_2155) from checkpoint path for default outputs
 RUN_NAME=$(basename "${CKPT_RUN%/}")
-if [[ "$RUN_NAME" != run_* ]]; then
-    RUN_NAME="run_${RUN_NAME}"
-fi
-if [[ $EPOCH19 -eq 1 ]]; then
-    RUN_NAME="${RUN_NAME}_epoch19"
+if [[ -z "$RUN_NAME" ]]; then
+    RUN_NAME="$DEFAULT_CKPT_NAME"
 fi
 
 PI3X_IS_TRUE=0
@@ -240,13 +225,6 @@ fi
 
 WINDOW_TAG="win${WINDOW_SIZE}o${OVERLAP_SIZE}${SIM3_SUFFIX}${SE3_SUFFIX}"
 
-if [[ "$CKPT_RUN" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-    run_tail=$(basename "${CKPT_RUN%/}")
-    if [[ "$run_tail" != run_* ]]; then
-        IS_HF_MODEL=1
-    fi
-fi
-
 if [[ $OUTPUT_ROOT_SPECIFIED -eq 0 ]]; then
     OUTPUT_ROOT="${REPO_ROOT}/eval_results/${RUN_NAME}/${WINDOW_TAG}/video_depth"
 fi
@@ -255,34 +233,9 @@ if [[ ${#DATASETS[@]} -eq 0 ]]; then
     DATASETS=("bonn_s1_500")
 fi
 
-relative_ckpt_dir="ckpts/${CKPT_RUN}"
-config_path="${REPO_ROOT}/${relative_ckpt_dir}/original_config.yaml"
-node_dir="${REPO_ROOT}/${relative_ckpt_dir}/checkpoints/node_0"
-if [[ $EPOCH19 -eq 1 ]]; then
-    weights_path="${node_dir}/checkpoint_epoch_19.pt"
-else
-    weights_path="${node_dir}/latest.pt"
-fi
-
-if [[ $IS_HF_MODEL -eq 1 ]]; then
-    weights_path="$CKPT_RUN"
-    if [[ $PI3_CONFIG_SPECIFIED -eq 0 ]]; then
-        PI3_CONFIG_ENABLED=0
-        PI3_CONFIG=""
-    fi
-    SKIP_DOWNLOAD=1
-fi
-
-if [[ "$CKPT_RUN" == "$DEFAULT_RUN_PATH" && -z "$WEIGHTS_PATH" ]]; then
-    echo "Mapping ${CKPT_RUN} to default Hugging Face weights yyfz233/Pi3."
-    weights_path="yyfz233/Pi3"
-    IS_HF_MODEL=1
-    SKIP_DOWNLOAD=1
-    if [[ $PI3_CONFIG_SPECIFIED -eq 0 ]]; then
-        PI3_CONFIG_ENABLED=0
-        PI3_CONFIG=""
-    fi
-fi
+ckpt_dir="${REPO_ROOT}/ckpts/${CKPT_RUN}"
+config_path="${ckpt_dir}/original_config.yaml"
+weights_path="${ckpt_dir}/latest.pt"
 
 if [[ -n "$WEIGHTS_PATH" ]]; then
     weights_path="$WEIGHTS_PATH"
@@ -296,61 +249,20 @@ if [[ $PI3_CONFIG_ENABLED -eq 1 && $PI3_CONFIG_SPECIFIED -eq 0 ]]; then
     fi
 fi
 
-download_checkpoint() {
-    local run_path="$1"
-    echo "Ensuring checkpoint assets for ${run_path}"
-
-    mkdir -p "${REPO_ROOT}/ckpts/${run_path}/checkpoints/node_0"
-
-    local commands=(
-        "python ~/Code/Management/syncutil.py download Checkpoints \"${run_path}/checkpoints/node_0\" --force --viscam"
-        "python ~/Code/Management/syncutil.py download Checkpoints \"${run_path}/original_config.yaml\" --force --viscam"
-        "python ~/Code/Management/syncutil.py download Checkpoints \"${run_path}/checkpoints/node_0\" --force"
-        "python ~/Code/Management/syncutil.py download Checkpoints \"${run_path}/original_config.yaml\" --force"
-    )
-
-    for cmd in "${commands[@]}"; do
-        echo "Running: ${cmd}"
-        if ! eval "${cmd}"; then
-            echo "Warning: command failed -> ${cmd}" >&2
+if [[ ! -f "$weights_path" ]]; then
+    if [[ -z "$WEIGHTS_PATH" && -d "$ckpt_dir" ]]; then
+        candidate=$(find "$ckpt_dir" -maxdepth 1 -type f -name '*.pt' | sort | head -n 1 || true)
+        if [[ -n "${candidate:-}" ]]; then
+            weights_path="$candidate"
+            echo "Using checkpoint file ${weights_path}"
         fi
-    done
-}
-
-if [[ $IS_HF_MODEL -eq 0 && $SKIP_DOWNLOAD -eq 0 && -z "$WEIGHTS_PATH" ]]; then
-    if [[ -x "${REPO_ROOT}/download_ckpt_gcp.sh" ]]; then
-        echo "Invoking download_ckpt_gcp.sh ${CKPT_RUN}"
-        if ! "${REPO_ROOT}/download_ckpt_gcp.sh" "${CKPT_RUN}"; then
-            echo "download_ckpt_gcp.sh returned a non-zero status, attempting manual sync..." >&2
-        fi
-    fi
-
-    if [[ ! -f "$config_path" || ! -d "$node_dir" ]]; then
-        download_checkpoint "$CKPT_RUN"
     fi
 fi
 
-if [[ $PI3_CONFIG_ENABLED -eq 1 && $PI3_CONFIG_SPECIFIED -eq 0 && -z "$PI3_CONFIG" && -f "$config_path" ]]; then
-    PI3_CONFIG="$config_path"
-fi
-
-if [[ $IS_HF_MODEL -eq 0 ]]; then
-    if [[ -z "$WEIGHTS_PATH" && ! -f "$weights_path" ]]; then
-        if [[ -d "$node_dir" ]]; then
-            candidate=$(find "$node_dir" -maxdepth 1 -type f -name '*.pt' | sort | head -n 1 || true)
-            if [[ -n "${candidate:-}" ]]; then
-                weights_path="$candidate"
-                echo "Using checkpoint file ${weights_path}"
-            fi
-        fi
-    fi
-
-    if [[ ! -f "$weights_path" ]]; then
-        echo "Error: checkpoint weights not found under ${node_dir}" >&2
-        exit 1
-    fi
-else
-    echo "Using default Pi3 weights from Hugging Face model '${weights_path}'."
+if [[ ! -f "$weights_path" ]]; then
+    echo "Error: checkpoint weights not found (${weights_path})" >&2
+    echo "Expected default path: ${ckpt_dir}/latest.pt" >&2
+    exit 1
 fi
 
 if [[ $PI3_CONFIG_ENABLED -eq 1 && -n "$PI3_CONFIG" && ! -f "$PI3_CONFIG" ]]; then
@@ -392,19 +304,8 @@ for dataset in "${DATASETS[@]}"; do
         "${pi3_flag[@]}" \
         "${forward_args[@]}"
 
-    # scale&shift scale metric
-    # python eval/video_depth/eval_depth.py \
-    # --output_dir "$output_dir" \
-    # --eval_dataset "$dataset" \
-    # --align "metric"
-
     python eval/video_depth/eval_depth.py \
-    --output_dir "$output_dir" \
-    --eval_dataset "$dataset" \
-    --align "scale"
-
-    # python eval/video_depth/eval_depth.py \
-    # --output_dir "$output_dir" \
-    # --eval_dataset "$dataset" \
-    # --align "scale&shift"
+        --output_dir "$output_dir" \
+        --eval_dataset "$dataset" \
+        --align "scale"
 done

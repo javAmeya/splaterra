@@ -577,6 +577,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
+            attn_gate_scales,
         )
     
     def forward(self, imgs, *args, **kwargs):
@@ -662,7 +663,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
-        
+        per_window_gate_records = []
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
             if reset_every > 0 and window_idx > 0 and window_idx % reset_every == 0:
@@ -716,7 +717,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, _decode_attn_gate_scales = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -729,6 +730,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
                 if decode_avg_attn_gate_scale is not None:
                     all_attn_gate_scales.append(decode_avg_attn_gate_scale.detach().cpu())
+                per_window_gate_records.append({
+                    "window": window_idx,
+                    "ttt_per_layer": [g.detach().abs().mean().item() for g in _decode_gate_scales],
+                    "swa_per_layer": [g.detach().abs().mean().item() for g in _decode_attn_gate_scales],
+                })
+
 
                 # TODO: get the updated state from the ttt layer
                 if self.ttt_layers is not None and ttt_output_info is not None:
@@ -825,16 +832,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             all_predictions.append(pred_dict)
 
         # Merge windowed predictions
+        # When reset is enabled but explicit Sim3/SE3 alignment is off, keep each reset block
+        # in a stable rigid frame by applying one estimated transform per block.
+        align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
         if sim3:
             merged = self._merge_windowed_predictions_sim3(
                 all_predictions, 
                 allow_scale=True, 
                 scale_mode=sim3_scale_mode,
             )
-        elif se3:
+        elif se3 or align_on_resets_without_explicit_pose:
             merged = self._merge_windowed_predictions_sim3(
                 all_predictions, 
                 allow_scale=False,
+                reset_every=reset_every,
+                reuse_transform_within_reset_block=align_on_resets_without_explicit_pose,
             )
         else:
             merged = self._merge_windowed_predictions(all_predictions, eff_window_size, eff_overlap)
@@ -842,6 +854,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+        if all_gate_scales:
+            merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
+        if all_attn_gate_scales:
+            merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+        merged["per_window_gate_records"] = per_window_gate_records   # <-- add this
         
         return merged
 
@@ -959,11 +976,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         return merged_predictions
 
-    def _merge_windowed_predictions_sim3(self, all_predictions, allow_scale: bool = True, scale_mode: str = 'median'):
+    def _merge_windowed_predictions_sim3(
+        self,
+        all_predictions,
+        allow_scale: bool = True,
+        scale_mode: str = 'median',
+        reset_every: int = 0,
+        reuse_transform_within_reset_block: bool = False,
+    ):
         """
         Merge windowed predictions by estimating relative poses between overlaps.
         When ``allow_scale`` is True this performs Sim(3) alignment (scale+SE(3));
         when False it reduces to SE(3) alignment by keeping the scale fixed to 1.
+        If ``reuse_transform_within_reset_block`` is enabled with ``reset_every > 0``,
+        one transform is estimated at each reset boundary and reused for the rest of
+        that reset block.
         """
         # print("allow_scale -----------------------------", allow_scale)
         if not all_predictions:
@@ -1116,16 +1143,43 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
             return relative_scale, relative_rot.to(dtype), relative_trans.to(dtype)
 
+        block_scale: Optional[torch.Tensor] = None
+        block_rot: Optional[torch.Tensor] = None
+        block_trans: Optional[torch.Tensor] = None
+
         for window_idx, pred in enumerate(all_predictions):
             if window_idx == 0:
                 current_scale = torch.ones_like(one_scale)
                 current_rot = identity_rot.clone()
                 current_trans = zero_trans.clone()
+                if reuse_transform_within_reset_block and reset_every > 0:
+                    block_scale = current_scale.clone()
+                    block_rot = current_rot.clone()
+                    block_trans = current_trans.clone()
             else:
                 prev_aligned = aligned_predictions[-1]
-                current_scale, current_rot, current_trans = _estimate_relative_sim3(
-                    prev_aligned, pred, overlap_size, allow_scale
+                reuse_block_transform = (
+                    reuse_transform_within_reset_block
+                    and reset_every > 0
+                    and window_idx % reset_every != 0
+                    and block_rot is not None
+                    and block_trans is not None
                 )
+                if reuse_block_transform:
+                    current_rot = block_rot.clone()
+                    current_trans = block_trans.clone()
+                    if allow_scale and block_scale is not None:
+                        current_scale = block_scale.clone()
+                    else:
+                        current_scale = torch.ones_like(one_scale)
+                else:
+                    current_scale, current_rot, current_trans = _estimate_relative_sim3(
+                        prev_aligned, pred, overlap_size, allow_scale
+                    )
+                    if reuse_transform_within_reset_block and reset_every > 0:
+                        block_scale = current_scale.clone()
+                        block_rot = current_rot.clone()
+                        block_trans = current_trans.clone()
 
             if allow_scale and sim3_scales is not None:
                 sim3_scales.append(current_scale.clone())

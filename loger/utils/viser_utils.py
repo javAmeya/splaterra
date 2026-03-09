@@ -285,7 +285,6 @@ def viser_wrapper(
         gui_conf     = server.gui.add_slider("Confidence Percent", 0,100,0.1, init_conf_threshold)
         gui_point_size = server.gui.add_slider("Point Size", 0.0001, 0.05, 0.0001, point_size)
         gui_camera_size = server.gui.add_slider("Camera Size", 0.01, 0.3, 0.01, 0.03)
-        gui_perturbation = server.gui.add_checkbox("Perturbation", False)
         gui_camera_follow = server.gui.add_checkbox("Camera Follow Cam0", False)
         gui_camera_follow_lag = server.gui.add_slider("Follow Lag (frames)", 0, min(30, max(0, S - 1)), 1, min(10, max(0, S - 1)))
         gui_camera_follow_backoff = server.gui.add_slider("Follow Backoff", 0.0, 3.0, 0.01, 0.25)
@@ -310,51 +309,9 @@ def viser_wrapper(
         thresh = percent / 100.0
         return (conf_array >= thresh) & (conf_array > 1e-5)
 
-    def _frame_min_adjacent_distance(frame_xyz: np.ndarray, threshold: float = 1e-3) -> np.ndarray:
-        if frame_xyz.ndim != 3 or frame_xyz.shape[-1] != 3:
-            return np.zeros(3, dtype=np.float32)
-
-        deltas = []
-        if frame_xyz.shape[1] > 1:
-            deltas.append(np.abs(frame_xyz[:, 1:, :] - frame_xyz[:, :-1, :]).reshape(-1, 3))
-        if frame_xyz.shape[0] > 1:
-            deltas.append(np.abs(frame_xyz[1:, :, :] - frame_xyz[:-1, :, :]).reshape(-1, 3))
-        if not deltas:
-            return np.zeros(3, dtype=np.float32)
-
-        all_deltas = np.concatenate(deltas, axis=0)
-        dmin_xyz = np.zeros(3, dtype=np.float32)
-        for axis in range(3):
-            axis_delta = all_deltas[:, axis]
-            valid_axis = np.isfinite(axis_delta) & (axis_delta > threshold)
-            if np.any(valid_axis):
-                dmin_xyz[axis] = float(np.min(axis_delta[valid_axis]))
-        return dmin_xyz
-
-    def _build_perturbed_xyz_data(base_xyz_data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        rng = np.random.default_rng(0)
-        out = {}
-        for cam_id in cam_ids:
-            xyz_cam = base_xyz_data[cam_id]
-            xyz_perturbed = xyz_cam.copy()
-            for i, frame_xyz in enumerate(xyz_cam):
-                dmin_xyz = _frame_min_adjacent_distance(frame_xyz, threshold=0.001)
-                print(f"dmin_xyz: {dmin_xyz}")
-                if np.all(dmin_xyz <= 0.0):
-                    continue
-                offset = rng.uniform(
-                    low=-0.5 * dmin_xyz,
-                    high=0.5 * dmin_xyz,
-                    size=frame_xyz.shape,
-                ).astype(xyz_cam.dtype)
-                xyz_perturbed[i] = frame_xyz + offset
-            out[cam_id] = xyz_perturbed
-        return out
-
     # ───────────── Create All Frame Nodes ─────────────
     # 不再进行中心化处理，直接使用原始坐标
     xyz_centered_data = {}
-    perturbed_xyz_data: Optional[dict[str, np.ndarray]] = None
 
     # First, collect all camera poses to find the canonical transform
     T0_inv = None
@@ -428,12 +385,6 @@ def viser_wrapper(
             # 直接使用原始点云坐标，不进行中心化
             xyz_centered_data[cam_id] = xyz_data[cam_id]
 
-    def ensure_perturbed_xyz_data():
-        nonlocal perturbed_xyz_data
-        if perturbed_xyz_data is None:
-            print("Generating perturbation offsets...")
-            perturbed_xyz_data = _build_perturbed_xyz_data(xyz_centered_data)
-
     # Camera follow uses cam0 camera trajectory over the frame slider.
     cam0_poses = cam2world_data["cam0"]  # (S, 3, 4)
     cam0_positions = cam0_poses[:, :3, 3]
@@ -463,12 +414,7 @@ def viser_wrapper(
 
             # Point Cloud
             current_conf = conf_data[cam_id][i]
-            if gui_perturbation.value:
-                ensure_perturbed_xyz_data()
-                assert perturbed_xyz_data is not None
-                current_xyz_c = perturbed_xyz_data[cam_id][i]
-            else:
-                current_xyz_c = xyz_centered_data[cam_id][i]
+            current_xyz_c = xyz_centered_data[cam_id][i]
             current_img = img_data[cam_id][i]
 
             if gui_show_cams[cam_id].value:
@@ -565,12 +511,7 @@ def viser_wrapper(
             for cam_id in cam_ids:
                 if gui_show_cams[cam_id].value :
                     current_conf = conf_data[cam_id][i]
-                    if gui_perturbation.value:
-                        ensure_perturbed_xyz_data()
-                        assert perturbed_xyz_data is not None
-                        current_xyz_c = perturbed_xyz_data[cam_id][i]
-                    else:
-                        current_xyz_c = xyz_centered_data[cam_id][i]
+                    current_xyz_c = xyz_centered_data[cam_id][i]
                     current_img = img_data[cam_id][i]
 
                     mask = gen_mask(current_conf, pct)
@@ -655,10 +596,6 @@ def viser_wrapper(
     def _(_):
         set_visibility()
 
-    @gui_perturbation.on_update
-    def _(_):
-        refresh_pointclouds()
-    
     @gui_start_frame.on_update
     def _(_): set_visibility()
     
@@ -689,7 +626,6 @@ def viser_wrapper(
                     xyz_centered_data[cam_id] = xyz_transformed.reshape(original_shape)
                 else:
                     xyz_centered_data[cam_id] = xyz_data[cam_id]
-            perturbed_xyz_data = None
             
             # Refresh point clouds with new subsample
             refresh_pointclouds()
