@@ -170,7 +170,7 @@ def main():
     # base config, all sweeps default to this unless overridden
     base_fw = dict(
         window_size=32,
-        overlap_size=16,
+        overlap_size=3,
         sim3=True,
         sim3_scale_mode="median",
         se3=False,
@@ -219,7 +219,7 @@ def main():
 
     # ---------------- Sweep A: window_size ----------------
     if "A" not in skip:
-        vals = [64]
+        vals = [8, 16, 24, 32, 48, 64]
         for i, ws in enumerate(vals):
             fw = build_kwargs(base_fw, window_size=ws)
             run_config_safely("A", "window_size", ws, images_base, fw, save=True)
