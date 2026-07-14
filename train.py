@@ -82,11 +82,13 @@ for iteration in range(first_iteration,opt.iterations+1):
 
     # Loss Calculation
 
+    # Loss Calculation
+
     image = render_pkg["render"]
 
     gt_image = viewpoint_cam.original_image
     Ll1 = L.l1_loss(image, gt_image)
-    ssim_value = ssim(image, gt_image)
+    ssim_value = ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
     # Depth regularization
@@ -119,7 +121,7 @@ for iteration in range(first_iteration,opt.iterations+1):
 # Perform densification only until the specified iteration
     if iteration < opt.densify_until_iter:
 
-    # Update the maximum projected radius of each Gaussian
+   # Update the maximum projected radius of each Gaussian
         gaussians.max_radii2D = torch.maximum(
             gaussians.max_radii2D,
             render_pkg["radii"]

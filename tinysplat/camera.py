@@ -1,7 +1,7 @@
 class Camera:
 
     def __init__(self, view_matrix, K, width, height, original_image,
-                 invdepthmap=None, depth_mask=None, depth_reliable=False
+                 invdepthmap=None, depth_mask=None, depth_reliable=False,
                  znear=0.01, zfar=100.0):
         self.view_matrix = view_matrix
         self.K = K

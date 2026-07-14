@@ -124,11 +124,12 @@ class GaussianModel:
                 param_group['lr'] = lr
                 return lr
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-    self.xyz_gradient_accum[update_filter] += torch.norm(
-        viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
-    )
-    self.denom[update_filter] += 1
-
+        grad = viewspace_point_tensor.grad[0]   # (1,N,2) -> (N,2), grad already populated by backward()
+        self.xyz_gradient_accum[update_filter] += torch.norm(
+        grad[update_filter, :2], dim=-1, keepdim=True
+        )
+        self.denom[update_filter] += 1
+        
     def densify_and_prune(self, max_grad=0.0002, min_opacity=0.005, extent=1.0, max_screen_size=20):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
