@@ -10,6 +10,7 @@ def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False):
         near_plane=viewpoint_camera.znear, far_plane=viewpoint_camera.zfar,
         render_mode="RGB+ED",
         rasterize_mode="antialiased" if pipe.antialiasing else "classic",
+        packed=False,
     )
 
     meta["means2d"].retain_grad()   # must retain on the ORIGINAL, before slicing
@@ -17,10 +18,10 @@ def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False):
     radii = meta["radii"][0].max(dim=-1).values
     visibility_filter = radii > 0
     image = render_colors[0, ..., :3].permute(2, 0, 1)
-    invdepth = render_colors[0, ..., 3]
+    depth = render_colors[0, ..., 3]
 
     return {
-        "render": image, "depth": invdepth, "radii": radii,
+        "render": image, "depth": depth, "radii": radii,
         "viewspace_points": meta["means2d"],   # kept batched on purpose
         "visibility_filter": visibility_filter,
     }

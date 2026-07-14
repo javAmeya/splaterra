@@ -17,6 +17,8 @@ opt = OptimizationParams()
 dataset = ModelParams()
 dataset.source_path = "/path/to/your/colmap/dataset"
 dataset.images = "images"
+checkpoint_path = None
+
 
 # --- Load COLMAP scene ---
 points, point_colors, train_cameras = load_colmap_scene(
@@ -27,11 +29,42 @@ points, point_colors, train_cameras = load_colmap_scene(
 
 scene = Scene(train_cameras=train_cameras)
 gaussians = GaussianModel(sh_degree=dataset.sh_degree)
-gaussians.create_from_pcd(points, point_colors, device="cuda")
-gaussians.training_setup(opt)
+
+if checkpoint_path is None:
+
+    gaussians.create_from_pcd(
+        points,
+        point_colors,
+        device="cuda"
+    )
+
+    first_iteration = 0
+
+else:
+
+    print(f"Loading checkpoint: {checkpoint_path}")
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu"
+    )
+
+    gaussians.restore(
+        checkpoint["gaussians"],
+        device="cuda"
+    )
+
+    first_iteration = checkpoint["iteration"] + 1
+
+gaussians.training_setup(
+    opt,
+    spatial_lr_scale=scene.cameras_extent
+)
+
 optimizer = gaussians.optimizer
 
-first_iteration = 0
+if checkpoint_path is not None:
+    optimizer.load_state_dict(checkpoint["optimizer"])
 device = gaussians.xyz.device
 
 viewpoint_stack = scene.getTrainCameras().copy()
@@ -98,12 +131,16 @@ for iteration in range(first_iteration,opt.iterations+1):
     if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
 
     # Predicted inverse depth map
-        invdepth = render_pkg["depth"]
+        pred_depth = render_pkg["depth"]
+
+        pred_invdepth = 1.0 / (pred_depth + 1e-6)
 
         mono_invdepth = viewpoint_cam.invdepthmap
         depth_mask = viewpoint_cam.depth_mask
 
-        depth_loss = torch.abs((invdepth - mono_invdepth) * depth_mask).mean()
+        depth_loss = torch.abs(
+            (pred_invdepth - mono_invdepth) * depth_mask
+        ).mean()
 
     # Weight the depth loss
         
@@ -139,7 +176,7 @@ for iteration in range(first_iteration,opt.iterations+1):
             and iteration % opt.densification_interval == 0
         ):
 
-            gaussians.densify_and_prune()
+            gaussians.densify_and_prune(extent=scene.cameras_extent)
 
     # Reset opacity periodically
         if (
@@ -164,6 +201,7 @@ for iteration in range(first_iteration,opt.iterations+1):
             torch.save({
             "iteration": iteration,
             "gaussians": gaussians.capture(),
+            "optimizer": optimizer.state_dict(),
         },
         f"checkpoints/checkpoint_{iteration}.pth"
         )
