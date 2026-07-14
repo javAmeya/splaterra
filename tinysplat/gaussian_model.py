@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from tinysplat.utils import get_expon_lr_func
+from tinysplat.utils import get_expon_lr_func, build_rotation
 from scipy.spatial import cKDTree
 
 
@@ -124,161 +124,156 @@ class GaussianModel:
                 param_group['lr'] = lr
                 return lr
 
-    def add_densification_stats(self, viewspace_points, visibility_filter):
-        grads = viewspace_points.grad[visibility_filter, :2]
-        self.xyz_gradient_accum[visibility_filter] += grads.norm(dim=-1, keepdim=True)
-        self.denom[visibility_filter] += 1
-
     def densify_and_prune(self, max_grad=0.0002, min_opacity=0.005, extent=1.0, max_screen_size=20):
-    grads = self.xyz_gradient_accum / self.denom
-    grads[grads.isnan()] = 0.0
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
 
-    self._densify_and_clone(grads, max_grad, extent)
-    self._densify_and_split(grads, max_grad, extent)
+        self._densify_and_clone(grads, max_grad, extent)
+        self._densify_and_split(grads, max_grad, extent)
 
-    prune_mask = (self.get_opacity <= min_opacity).squeeze(-1)
-    if max_screen_size:
-        big_points_vs = self.max_radii2D > max_screen_size
-        big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-        prune_mask = prune_mask | big_points_vs | big_points_ws
-    self._prune_points(prune_mask)
+        prune_mask = (self.get_opacity <= min_opacity).squeeze(-1)
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = prune_mask | big_points_vs | big_points_ws
+        self._prune_points(prune_mask)
 
-    n = self.xyz.shape[0]
-    device = self.xyz.device
-    self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
-    self.denom = torch.zeros((n, 1), device=device)
-    self.max_radii2D = torch.zeros(n, device=device)
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        n = self.xyz.shape[0]
+        device = self.xyz.device
+        self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
+        self.denom = torch.zeros((n, 1), device=device)
+        self.max_radii2D = torch.zeros(n, device=device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-# --- internal helpers ---
+    # --- internal helpers ---
 
     def _replace_tensor_in_optimizer(self, tensor, name):
-    for group in self.optimizer.param_groups:
-        if group["name"] == name:
-            state = self.optimizer.state.get(group["params"][0], None)
-            if state is not None:
-                state["exp_avg"] = torch.zeros_like(tensor)
-                state["exp_avg_sq"] = torch.zeros_like(tensor)
-                del self.optimizer.state[group["params"][0]]
-            group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-            self.optimizer.state[group["params"][0]] = state if state is not None else {}
-            return group["params"][0]
+        for group in self.optimizer.param_groups:
+            if group["name"] == name:
+                state = self.optimizer.state.get(group["params"][0], None)
+                if state is not None:
+                    state["exp_avg"] = torch.zeros_like(tensor)
+                    state["exp_avg_sq"] = torch.zeros_like(tensor)
+                    del self.optimizer.state[group["params"][0]]
+                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                self.optimizer.state[group["params"][0]] = state if state is not None else {}
+                return group["params"][0]
 
     def _prune_optimizer(self, mask):
-    result = {}
-    for group in self.optimizer.param_groups:
-        old_param = group["params"][0]
-        new_tensor = old_param[mask]
-        state = self.optimizer.state.get(old_param, None)
-        if state is not None:
-            state["exp_avg"] = state["exp_avg"][mask]
-            state["exp_avg_sq"] = state["exp_avg_sq"][mask]
-            del self.optimizer.state[old_param]
-        group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
-        if state is not None:
-            self.optimizer.state[group["params"][0]] = state
-        result[group["name"]] = group["params"][0]
-    return result
+        result = {}
+        for group in self.optimizer.param_groups:
+            old_param = group["params"][0]
+            new_tensor = old_param[mask]
+            state = self.optimizer.state.get(old_param, None)
+            if state is not None:
+                state["exp_avg"] = state["exp_avg"][mask]
+                state["exp_avg_sq"] = state["exp_avg_sq"][mask]
+                del self.optimizer.state[old_param]
+            group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
+            if state is not None:
+                self.optimizer.state[group["params"][0]] = state
+            result[group["name"]] = group["params"][0]
+        return result
 
     def _prune_points(self, mask):
-    valid = ~mask
-    result = self._prune_optimizer(valid)
+        valid = ~mask
+        result = self._prune_optimizer(valid)
 
-    self.xyz = result["xyz"]
-    self.scales = result["scaling"]
-    self.rotations = result["rotation"]
-    self.opacity = result["opacity"]
-    self.features_dc = result["f_dc"]
-    self.features_rest = result["f_rest"]
+        self.xyz = result["xyz"]
+        self.scales = result["scaling"]
+        self.rotations = result["rotation"]
+        self.opacity = result["opacity"]
+        self.features_dc = result["f_dc"]
+        self.features_rest = result["f_rest"]
 
-    self.xyz_gradient_accum = self.xyz_gradient_accum[valid]
-    self.denom = self.denom[valid]
-    self.max_radii2D = self.max_radii2D[valid]
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid]
+        self.denom = self.denom[valid]
+        self.max_radii2D = self.max_radii2D[valid]
 
     def _cat_tensors_to_optimizer(self, tensors_dict):
-    result = {}
-    for group in self.optimizer.param_groups:
-        extra = tensors_dict[group["name"]]
-        old_param = group["params"][0]
-        state = self.optimizer.state.get(old_param, None)
-        new_tensor = torch.cat([old_param, extra], dim=0)
-        if state is not None:
-            zeros = torch.zeros_like(extra)
-            state["exp_avg"] = torch.cat([state["exp_avg"], zeros], dim=0)
-            state["exp_avg_sq"] = torch.cat([state["exp_avg_sq"], zeros], dim=0)
-            del self.optimizer.state[old_param]
-        group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
-        if state is not None:
-            self.optimizer.state[group["params"][0]] = state
-        result[group["name"]] = group["params"][0]
-    return result
+        result = {}
+        for group in self.optimizer.param_groups:
+            extra = tensors_dict[group["name"]]
+            old_param = group["params"][0]
+            state = self.optimizer.state.get(old_param, None)
+            new_tensor = torch.cat([old_param, extra], dim=0)
+            if state is not None:
+                zeros = torch.zeros_like(extra)
+                state["exp_avg"] = torch.cat([state["exp_avg"], zeros], dim=0)
+                state["exp_avg_sq"] = torch.cat([state["exp_avg_sq"], zeros], dim=0)
+                del self.optimizer.state[old_param]
+            group["params"][0] = nn.Parameter(new_tensor.requires_grad_(True))
+            if state is not None:
+                self.optimizer.state[group["params"][0]] = state
+            result[group["name"]] = group["params"][0]
+        return result
 
     def _densification_postfix(self, new_xyz, new_scales, new_rotations,
-                            new_opacity, new_features_dc, new_features_rest):
-    result = self._cat_tensors_to_optimizer({
-        "xyz": new_xyz, "scaling": new_scales, "rotation": new_rotations,
-        "opacity": new_opacity, "f_dc": new_features_dc, "f_rest": new_features_rest,
-    })
-    self.xyz = result["xyz"]
-    self.scales = result["scaling"]
-    self.rotations = result["rotation"]
-    self.opacity = result["opacity"]
-    self.features_dc = result["f_dc"]
-    self.features_rest = result["f_rest"]
+                                new_opacity, new_features_dc, new_features_rest):
+        result = self._cat_tensors_to_optimizer({
+            "xyz": new_xyz, "scaling": new_scales, "rotation": new_rotations,
+            "opacity": new_opacity, "f_dc": new_features_dc, "f_rest": new_features_rest,
+        })
+        self.xyz = result["xyz"]
+        self.scales = result["scaling"]
+        self.rotations = result["rotation"]
+        self.opacity = result["opacity"]
+        self.features_dc = result["f_dc"]
+        self.features_rest = result["f_rest"]
 
-    n = self.xyz.shape[0]
-    device = self.xyz.device
-    self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
-    self.denom = torch.zeros((n, 1), device=device)
-    self.max_radii2D = torch.zeros(n, device=device)
+        n = self.xyz.shape[0]
+        device = self.xyz.device
+        self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
+        self.denom = torch.zeros((n, 1), device=device)
+        self.max_radii2D = torch.zeros(n, device=device)
 
     def _densify_and_clone(self, grads, grad_threshold, extent):
-    # Small Gaussians with high positional gradient -> duplicate as-is,
-    # nudged slightly, so they can spread into under-reconstructed regions.
-    selected = torch.where(grads.squeeze(-1) >= grad_threshold, True, False)
-    selected &= self.get_scaling.max(dim=1).values <= 0.01 * extent
+        selected = torch.where(grads.squeeze(-1) >= grad_threshold, True, False)
+        selected &= self.get_scaling.max(dim=1).values <= 0.01 * extent
 
-    new_xyz = self.xyz[selected]
-    new_scales = self.scales[selected]
-    new_rotations = self.rotations[selected]
-    new_opacity = self.opacity[selected]
-    new_features_dc = self.features_dc[selected]
-    new_features_rest = self.features_rest[selected]
+        new_xyz = self.xyz[selected]
+        new_scales = self.scales[selected]
+        new_rotations = self.rotations[selected]
+        new_opacity = self.opacity[selected]
+        new_features_dc = self.features_dc[selected]
+        new_features_rest = self.features_rest[selected]
 
-    self._densification_postfix(new_xyz, new_scales, new_rotations,
-                                 new_opacity, new_features_dc, new_features_rest)
+        self._densification_postfix(new_xyz, new_scales, new_rotations,
+                                     new_opacity, new_features_dc, new_features_rest)
 
     def _densify_and_split(self, grads, grad_threshold, extent, n_split=2):
-    n_init = self.xyz.shape[0]
-    padded_grad = torch.zeros(n_init, device=self.xyz.device)
-    padded_grad[:grads.shape[0]] = grads.squeeze(-1)
+        n_init = self.xyz.shape[0]
+        padded_grad = torch.zeros(n_init, device=self.xyz.device)
+        padded_grad[:grads.shape[0]] = grads.squeeze(-1)
 
-    selected = padded_grad >= grad_threshold
-    selected &= self.get_scaling.max(dim=1).values > 0.01 * extent
+        selected = padded_grad >= grad_threshold
+        selected &= self.get_scaling.max(dim=1).values > 0.01 * extent
 
-    stds = self.get_scaling[selected].repeat(n_split, 1)
-    means = torch.zeros((stds.size(0), 3), device=self.xyz.device)
-    samples = torch.normal(mean=means, std=stds)
-    rots = self.get_rotation[selected].repeat(n_split, 1)  # simplified: no quat rotation of offset
+        stds = self.get_scaling[selected].repeat(n_split, 1)
+        means = torch.zeros((stds.size(0), 3), device=self.xyz.device)
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self.get_rotation[selected]).repeat(n_split, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.xyz[selected].repeat(n_split, 1)
+        
+        new_scales = torch.log(self.get_scaling[selected].repeat(n_split, 1) / (0.8 * n_split))
+        new_rotations = self.rotations[selected].repeat(n_split, 1)
+        new_opacity = self.opacity[selected].repeat(n_split, 1)
+        new_features_dc = self.features_dc[selected].repeat(n_split, 1, 1)
+        new_features_rest = self.features_rest[selected].repeat(n_split, 1, 1)
 
-    new_xyz = self.xyz[selected].repeat(n_split, 1) + samples
-    new_scales = torch.log(self.get_scaling[selected].repeat(n_split, 1) / (0.8 * n_split))
-    new_rotations = self.rotations[selected].repeat(n_split, 1)
-    new_opacity = self.opacity[selected].repeat(n_split, 1)
-    new_features_dc = self.features_dc[selected].repeat(n_split, 1, 1)
-    new_features_rest = self.features_rest[selected].repeat(n_split, 1, 1)
+        self._densification_postfix(new_xyz, new_scales, new_rotations,
+                                     new_opacity, new_features_dc, new_features_rest)
 
-    self._densification_postfix(new_xyz, new_scales, new_rotations,
-                                 new_opacity, new_features_dc, new_features_rest)
-
-    prune_filter = torch.cat((selected, torch.zeros(n_split * selected.sum(), device=self.xyz.device, dtype=bool)))
-    self._prune_points(prune_filter)
+        prune_filter = torch.cat((selected, torch.zeros(n_split * selected.sum(), device=self.xyz.device, dtype=bool)))
+        self._prune_points(prune_filter)
 
     def reset_opacity(self):
         with torch.no_grad():
-            new_opacity = torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
-            self.opacity.data = torch.logit(new_opacity)
+        new_opacity = torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
+        new_opacity_param = torch.logit(new_opacity)
+
+    self.opacity = self._replace_tensor_in_optimizer(new_opacity_param, "opacity")
 
     def capture(self):
         return {

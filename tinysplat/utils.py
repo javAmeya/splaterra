@@ -20,6 +20,25 @@ def get_expon_lr_func(
     :param max_steps: int, the number of steps during optimization.
     :return HoF which takes step as input
     """
+    def build_rotation(q):
+    """
+    Convert a batch of quaternions (N, 4) in (w, x, y, z) order into
+    a batch of 3x3 rotation matrices (N, 3, 3).
+    """
+    q = torch.nn.functional.normalize(q, dim=-1)
+    r, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    R = torch.zeros((q.shape[0], 3, 3), device=q.device, dtype=q.dtype)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - r * z)
+    R[:, 0, 2] = 2 * (x * z + r * y)
+    R[:, 1, 0] = 2 * (x * y + r * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - r * x)
+    R[:, 2, 0] = 2 * (x * z - r * y)
+    R[:, 2, 1] = 2 * (y * z + r * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
 
     def helper(step):
         if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
