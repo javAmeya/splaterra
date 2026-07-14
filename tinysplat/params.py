@@ -38,7 +38,7 @@ class PipelineParams:
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
-        self.antialiasing = False
+        self.antialiasing = True
 
 
 class ModelParams:

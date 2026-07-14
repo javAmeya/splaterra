@@ -40,20 +40,15 @@ if checkpoint_path is None:
 
     first_iteration = 0
 
+# --- In train.py: Update the restore block ---
 else:
-
-    print(f"Loading checkpoint: {checkpoint_path}")
-
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu"
-    )
-
-    gaussians.restore(
-        checkpoint["gaussians"],
-        device="cuda"
-    )
-
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    gaussians.restore(checkpoint["gaussians"], device="cuda")
+    
+    # Re-initialize the optimizer with the restored parameters
+    gaussians.training_setup(opt, spatial_lr_scale=scene.cameras_extent)
+    gaussians.optimizer.load_state_dict(checkpoint["optimizer"])
+    
     first_iteration = checkpoint["iteration"] + 1
 
 gaussians.training_setup(
@@ -152,6 +147,7 @@ for iteration in range(first_iteration,opt.iterations+1):
 
    
     loss.backward()
+    
 
     #  Densification 
 
@@ -167,23 +163,23 @@ for iteration in range(first_iteration,opt.iterations+1):
         )
 
     # Accumulate statistics needed for densification
-        gaussians.add_densification_stats(
+    gaussians.add_densification_stats(
             render_pkg["viewspace_points"],
             render_pkg["visibility_filter"]
         )
 
     # Perform densification (clone/split) and pruning periodically
-        if (
-            iteration > opt.densify_from_iter
-            and iteration % opt.densification_interval == 0
+    if (
+        iteration > opt.densify_from_iter
+        and iteration % opt.densification_interval == 0
         ):
 
             gaussians.densify_and_prune(extent=scene.cameras_extent)
 
     # Reset opacity periodically
-        if (
-            iteration > opt.opacity_reset_interval
-            and iteration % opt.opacity_reset_interval == 0
+    if (
+        iteration > opt.opacity_reset_interval
+        and iteration % opt.opacity_reset_interval == 0
         ):
 
             gaussians.reset_opacity()
