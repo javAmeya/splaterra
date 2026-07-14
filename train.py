@@ -159,9 +159,11 @@ for iteration in range(first_iteration,opt.iterations+1):
     if iteration < opt.densify_until_iter:
 
    # Update the maximum projected radius of each Gaussian
-        gaussians.max_radii2D = torch.maximum(
-            gaussians.max_radii2D,
-            render_pkg["radii"]
+        visible = render_pkg["visibility_filter"]
+
+        gaussians.max_radii2D[visible] = torch.maximum(
+        gaussians.max_radii2D[visible],
+        render_pkg["radii"][visible]
         )
 
     # Accumulate statistics needed for densification
