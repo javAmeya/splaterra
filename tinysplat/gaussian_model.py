@@ -126,11 +126,12 @@ class GaussianModel:
                 return lr
     
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        
 
-    if viewspace_point_tensor.grad is None:
-        raise RuntimeError(
-            "means2d gradients are missing; densification statistics cannot be computed."
-        )
+        if viewspace_point_tensor.grad is None:
+            raise RuntimeError(
+                "means2d gradients are missing; densification statistics cannot be computed."
+                )
 
     grad = viewspace_point_tensor.grad[0]
 
