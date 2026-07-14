@@ -123,6 +123,11 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
+    def add_densification_stats(self, viewspace_point_tensor, update_filter):
+    self.xyz_gradient_accum[update_filter] += torch.norm(
+        viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
+    )
+    self.denom[update_filter] += 1
 
     def densify_and_prune(self, max_grad=0.0002, min_opacity=0.005, extent=1.0, max_screen_size=20):
         grads = self.xyz_gradient_accum / self.denom
@@ -270,10 +275,10 @@ class GaussianModel:
 
     def reset_opacity(self):
         with torch.no_grad():
-        new_opacity = torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
-        new_opacity_param = torch.logit(new_opacity)
+            new_opacity = torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
+            new_opacity_param = torch.logit(new_opacity)
 
-    self.opacity = self._replace_tensor_in_optimizer(new_opacity_param, "opacity")
+        self.opacity = self._replace_tensor_in_optimizer(new_opacity_param, "opacity")
 
     def capture(self):
         return {
