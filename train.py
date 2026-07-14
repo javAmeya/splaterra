@@ -31,26 +31,27 @@ scene = Scene(train_cameras=train_cameras)
 gaussians = GaussianModel(sh_degree=dataset.sh_degree)
 
 if checkpoint_path is None:
-
     gaussians.create_from_pcd(
         points,
         point_colors,
         device="cuda"
     )
-
     first_iteration = 0
 
-# --- In train.py: Update the restore block ---
 else:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    gaussians.restore(checkpoint["gaussians"], device="cuda")
-    
-    # Re-initialize the optimizer with the restored parameters
-    gaussians.training_setup(opt, spatial_lr_scale=scene.cameras_extent)
-    gaussians.optimizer.load_state_dict(checkpoint["optimizer"])
-    
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu"
+    )
+
+    gaussians.restore(
+        checkpoint["gaussians"],
+        device="cuda"
+    )
+
     first_iteration = checkpoint["iteration"] + 1
 
+# Create the optimizer exactly once
 gaussians.training_setup(
     opt,
     spatial_lr_scale=scene.cameras_extent
@@ -58,8 +59,11 @@ gaussians.training_setup(
 
 optimizer = gaussians.optimizer
 
+# Restore optimizer state if resuming
 if checkpoint_path is not None:
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    optimizer.load_state_dict(
+        checkpoint["optimizer"]
+    )
 device = gaussians.xyz.device
 
 viewpoint_stack = scene.getTrainCameras().copy()
@@ -153,27 +157,15 @@ for iteration in range(first_iteration,opt.iterations+1):
 
 # Perform densification only until the specified iteration
     if iteration < opt.densify_until_iter:
-
-   # Update the maximum projected radius of each Gaussian
         visible = render_pkg["visibility_filter"]
-
         gaussians.max_radii2D[visible] = torch.maximum(
-        gaussians.max_radii2D[visible],
-        render_pkg["radii"][visible]
+            gaussians.max_radii2D[visible], render_pkg["radii"][visible]
         )
-
-    # Accumulate statistics needed for densification
-    gaussians.add_densification_stats(
-            render_pkg["viewspace_points"],
-            render_pkg["visibility_filter"]
+        gaussians.add_densification_stats(
+            render_pkg["viewspace_points"], render_pkg["visibility_filter"]
         )
-
-    # Perform densification (clone/split) and pruning periodically
-    if (
-        iteration > opt.densify_from_iter
-        and iteration % opt.densification_interval == 0
-        ):
-
+        if (iteration > opt.densify_from_iter
+                and iteration % opt.densification_interval == 0):
             gaussians.densify_and_prune(extent=scene.cameras_extent)
 
     # Reset opacity periodically

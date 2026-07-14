@@ -126,21 +126,18 @@ class GaussianModel:
                 return lr
     
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        
-
         if viewspace_point_tensor.grad is None:
             raise RuntimeError(
                 "means2d gradients are missing; densification statistics cannot be computed."
-                )
+            )
 
-    grad = viewspace_point_tensor.grad[0]
+        grad = viewspace_point_tensor.grad[0]
 
-    self.xyz_gradient_accum[update_filter] += torch.norm(
-        grad[update_filter, :2], dim=-1, keepdim=True
-    )
+        self.xyz_gradient_accum[update_filter] += torch.norm(
+            grad[update_filter, :2], dim=-1, keepdim=True
+        )
 
-    self.denom[update_filter] += 1
-        
+        self.denom[update_filter] += 1
         
     def densify_and_prune(self, max_grad=0.0002, min_opacity=0.005, extent=1.0, max_screen_size=20):
         grads = self.xyz_gradient_accum / self.denom
@@ -304,41 +301,33 @@ class GaussianModel:
             "active_sh_degree": self.active_sh_degree,
         }
     def restore(self, state, device="cuda"):
-    """
-    Restore a GaussianModel from a checkpoint created by capture().
-    This recreates all trainable tensors as nn.Parameters so that
-    training_setup() can correctly build the optimizer afterwards.
-    """
+        """
+        Restore a GaussianModel from a checkpoint created by capture().
+        This recreates all trainable tensors as nn.Parameters so that
+        training_setup() can correctly build the optimizer afterwards.
+        """
+        self.xyz = nn.Parameter(
+            state["xyz"].to(device).requires_grad_(True)
+            )
+        self.scales = nn.Parameter(
+            state["scales"].to(device).requires_grad_(True)
+            )
+        self.rotations = nn.Parameter(
+            state["rotations"].to(device).requires_grad_(True)
+            )
+        self.opacity = nn.Parameter(
+            state["opacity"].to(device).requires_grad_(True)
+            )
+        self.features_dc = nn.Parameter(
+            state["features_dc"].to(device).requires_grad_(True)
+            )
+        self.features_rest = nn.Parameter(
+            state["features_rest"].to(device).requires_grad_(True)
+            )
 
-    self.xyz = nn.Parameter(
-        state["xyz"].to(device).requires_grad_(True)
-    )
+        self.active_sh_degree = state["active_sh_degree"]
 
-    self.scales = nn.Parameter(
-        state["scales"].to(device).requires_grad_(True)
-    )
-
-    self.rotations = nn.Parameter(
-        state["rotations"].to(device).requires_grad_(True)
-    )
-
-    self.opacity = nn.Parameter(
-        state["opacity"].to(device).requires_grad_(True)
-    )
-
-    self.features_dc = nn.Parameter(
-        state["features_dc"].to(device).requires_grad_(True)
-    )
-
-    self.features_rest = nn.Parameter(
-        state["features_rest"].to(device).requires_grad_(True)
-    )
-
-    self.active_sh_degree = state["active_sh_degree"]
-
-    # Recreate tensors used for densification/pruning
-    n = self.xyz.shape[0]
-
-    self.max_radii2D = torch.zeros(n, device=device)
-    self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
-    self.denom = torch.zeros((n, 1), device=device)
+        n = self.xyz.shape[0]
+        self.max_radii2D = torch.zeros(n, device=device)
+        self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
+        self.denom = torch.zeros((n, 1), device=device)
