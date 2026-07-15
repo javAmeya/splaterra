@@ -15,7 +15,7 @@ from tinysplat.colmap_loader import load_colmap_scene
 pipe = PipelineParams()
 opt = OptimizationParams()
 dataset = ModelParams()
-dataset.source_path = "/path/to/your/colmap/dataset"
+dataset.source_path = "/path/to/your/colmap/dataset_undistorted"
 dataset.images = "images"
 checkpoint_path = None
 
@@ -24,6 +24,7 @@ checkpoint_path = None
 points, point_colors, train_cameras = load_colmap_scene(
     dataset_path=dataset.source_path,
     images_dir=dataset.images,
+    sparse_subdir="sparse",
     device="cuda",
 )
 
@@ -36,7 +37,7 @@ if checkpoint_path is None:
         point_colors,
         device="cuda"
     )
-    first_iteration = 0
+    first_iteration = 1
 
 else:
     checkpoint = torch.load(
@@ -65,6 +66,18 @@ if checkpoint_path is not None:
         checkpoint["optimizer"]
     )
 device = gaussians.xyz.device
+
+gaussians.training_setup(
+    opt,
+    spatial_lr_scale=scene.cameras_extent,
+    camera_names=[c.image_name for c in train_cameras],
+    device=device,
+)
+
+optimizer = gaussians.optimizer
+
+if checkpoint_path is not None:
+    optimizer.load_state_dict(checkpoint["optimizer"])
 
 viewpoint_stack = scene.getTrainCameras().copy()
 viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -101,7 +114,7 @@ for iteration in range(first_iteration,opt.iterations+1):
 
     # Render 
 
-    device = gaussians.xyz.device
+    
 
     if opt.random_background:
         bg = torch.rand(3, dtype=torch.float32, device=device)
@@ -109,7 +122,7 @@ for iteration in range(first_iteration,opt.iterations+1):
         bg = background
 
 
-    render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp=dataset.train_test_exp,)
+    render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= True)
 
 
     # Loss Calculation
@@ -156,6 +169,7 @@ for iteration in range(first_iteration,opt.iterations+1):
     #  Densification 
 
 # Perform densification only until the specified iteration
+with torch.no_grad():
     if iteration < opt.densify_until_iter:
         visible = render_pkg["visibility_filter"]
         gaussians.max_radii2D[visible] = torch.maximum(
@@ -166,11 +180,17 @@ for iteration in range(first_iteration,opt.iterations+1):
         )
         if (iteration > opt.densify_from_iter
                 and iteration % opt.densification_interval == 0):
-            gaussians.densify_and_prune(extent=scene.cameras_extent)
+            size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+            gaussians.densify_and_prune(
+                max_grad=opt.densify_grad_threshold,
+                min_opacity=opt.opacity_cull,
+                extent=scene.cameras_extent,
+                max_screen_size=size_threshold,
+            )
 
     # Reset opacity periodically
     if (
-        iteration > opt.opacity_reset_interval
+        iteration >= opt.opacity_reset_interval
         and iteration % opt.opacity_reset_interval == 0
         ):
 
@@ -181,6 +201,9 @@ for iteration in range(first_iteration,opt.iterations+1):
 
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if gaussians.exposure_optimizer is not None:
+                gaussians.exposure_optimizer.step()
+                gaussians.exposure_optimizer.zero_grad(set_to_none=True)
 
     # Checkpoints 
 

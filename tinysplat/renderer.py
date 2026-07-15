@@ -20,6 +20,11 @@ def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False):
     image = render_colors[0, ..., :3].permute(2, 0, 1)
     depth = render_colors[0, ..., 3]
 
+    if use_trained_exp:
+        exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
+        image = torch.matmul(image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1)
+        image = image + exposure[:3, 3, None, None]
+
     return {
         "render": image, "depth": depth, "radii": radii,
         "viewspace_points": meta["means2d"],   # kept batched on purpose
