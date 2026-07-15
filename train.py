@@ -7,10 +7,12 @@ import torch.nn.functional as L
 
 from tinysplat import Scene, GaussianModel
 from tinysplat.renderer import render
-from tinysplat.losses import ssim
+from tinysplat.losses import ssim, psnr
+testing_iterations = [7000, 15000, 30000]
 from tinysplat.params import OptimizationParams, PipelineParams, ModelParams
 from tinysplat.utils import get_expon_lr_func
 from tinysplat.colmap_loader import load_colmap_scene
+
 
 pipe = PipelineParams()
 opt = OptimizationParams()
@@ -21,12 +23,18 @@ checkpoint_path = None
 
 
 # --- Load COLMAP scene ---
-points, point_colors, train_cameras = load_colmap_scene(
+
+dataset.eval = True   # add this near your other dataset.* settings
+
+points, point_colors, train_cameras, test_cameras = load_colmap_scene(
     dataset_path=dataset.source_path,
     images_dir=dataset.images,
     sparse_subdir="sparse",
     device="cuda",
+    eval=dataset.eval,
 )
+
+scene = Scene(train_cameras=train_cameras, test_cameras=test_cameras)
 
 scene = Scene(train_cameras=train_cameras)
 gaussians = GaussianModel(sh_degree=dataset.sh_degree)
@@ -111,7 +119,7 @@ for iteration in range(first_iteration,opt.iterations+1):
         bg = background
 
 
-    render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= True)
+    render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= False)
 
 
     # Loss Calculation
@@ -207,3 +215,22 @@ for iteration in range(first_iteration,opt.iterations+1):
         },
         f"checkpoints/checkpoint_{iteration}.pth"
         )
+     if iteration in testing_iterations and len(scene.getTestCameras()) > 0:
+        l1_test = 0.0
+        psnr_test = 0.0
+        test_cams = scene.getTestCameras()
+        with torch.no_grad():
+            for test_cam in test_cams:
+                render_pkg_test = render(
+                    viewpoint_camera=test_cam, pc=gaussians, pipe=pipe,
+                    bg_color=background, use_trained_exp=False,
+                )
+                image_test = torch.clamp(render_pkg_test["render"], 0.0, 1.0)
+                gt_test = torch.clamp(test_cam.original_image, 0.0, 1.0)
+                l1_test += L.l1_loss(image_test, gt_test).item()
+                psnr_test += psnr(image_test, gt_test).mean().item()
+
+        l1_test /= len(test_cams)
+        psnr_test /= len(test_cams)
+        print(f"\n[ITER {iteration}] Eval — L1 {l1_test:.4f}  PSNR {psnr_test:.2f}")
+

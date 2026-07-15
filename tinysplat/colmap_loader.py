@@ -330,6 +330,16 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
             original_image=image_tensor,
             image_name=img.name,
         )
+        
         cameras.append(cam)
+
+    if eval:
+        train_cameras = [c for idx, c in enumerate(cameras) if idx % llffhold != 0]
+        test_cameras  = [c for idx, c in enumerate(cameras) if idx % llffhold == 0]
+    else:
+        train_cameras = cameras
+        test_cameras = []
+
+    return points, point_colors, train_cameras, test_cameras
 
     return points, point_colors, cameras
