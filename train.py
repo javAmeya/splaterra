@@ -36,7 +36,6 @@ points, point_colors, train_cameras, test_cameras = load_colmap_scene(
 
 scene = Scene(train_cameras=train_cameras, test_cameras=test_cameras)
 
-scene = Scene(train_cameras=train_cameras)
 gaussians = GaussianModel(sh_degree=dataset.sh_degree)
 
 if checkpoint_path is None:
@@ -215,7 +214,7 @@ for iteration in range(first_iteration,opt.iterations+1):
         },
         f"checkpoints/checkpoint_{iteration}.pth"
         )
-     if iteration in testing_iterations and len(scene.getTestCameras()) > 0:
+    if iteration in testing_iterations and len(scene.getTestCameras()) > 0:
         l1_test = 0.0
         psnr_test = 0.0
         test_cams = scene.getTestCameras()
