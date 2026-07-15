@@ -328,6 +328,7 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
             width=width,
             height=height,
             original_image=image_tensor,
+            iamge_name=img.name,
         )
         cameras.append(cam)
 
