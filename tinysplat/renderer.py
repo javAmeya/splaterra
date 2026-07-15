@@ -1,5 +1,5 @@
 import gsplat
-
+import torch 
 def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False):
     render_colors, alpha, meta = gsplat.rasterization(
         means=pc.xyz, quats=pc.get_rotation, scales=pc.get_scaling,

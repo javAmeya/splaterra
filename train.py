@@ -53,18 +53,7 @@ else:
     first_iteration = checkpoint["iteration"] + 1
 
 # Create the optimizer exactly once
-gaussians.training_setup(
-    opt,
-    spatial_lr_scale=scene.cameras_extent
-)
 
-optimizer = gaussians.optimizer
-
-# Restore optimizer state if resuming
-if checkpoint_path is not None:
-    optimizer.load_state_dict(
-        checkpoint["optimizer"]
-    )
 device = gaussians.xyz.device
 
 gaussians.training_setup(
@@ -169,24 +158,24 @@ for iteration in range(first_iteration,opt.iterations+1):
     #  Densification 
 
 # Perform densification only until the specified iteration
-with torch.no_grad():
-    if iteration < opt.densify_until_iter:
-        visible = render_pkg["visibility_filter"]
-        gaussians.max_radii2D[visible] = torch.maximum(
-            gaussians.max_radii2D[visible], render_pkg["radii"][visible]
-        )
-        gaussians.add_densification_stats(
-            render_pkg["viewspace_points"], render_pkg["visibility_filter"]
-        )
-        if (iteration > opt.densify_from_iter
-                and iteration % opt.densification_interval == 0):
-            size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-            gaussians.densify_and_prune(
-                max_grad=opt.densify_grad_threshold,
-                min_opacity=opt.opacity_cull,
-                extent=scene.cameras_extent,
-                max_screen_size=size_threshold,
+    with torch.no_grad():
+        if iteration < opt.densify_until_iter:
+            visible = render_pkg["visibility_filter"]
+            gaussians.max_radii2D[visible] = torch.maximum(
+                gaussians.max_radii2D[visible], render_pkg["radii"][visible]
             )
+            gaussians.add_densification_stats(
+                render_pkg["viewspace_points"], render_pkg["visibility_filter"]
+            )
+            if (iteration > opt.densify_from_iter
+                    and iteration % opt.densification_interval == 0):
+                size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                gaussians.densify_and_prune(
+                    max_grad=opt.densify_grad_threshold,
+                    min_opacity=opt.opacity_cull,
+                    extent=scene.cameras_extent,
+                    max_screen_size=size_threshold,
+                )
 
     # Reset opacity periodically
     if (
