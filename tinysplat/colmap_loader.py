@@ -257,7 +257,8 @@ def _colmap_params_to_K(model, params):
 # ---------------------------------------------------------------------------
 
 def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0",
-                       device="cuda", resolution_scale=1.0):
+                       device="cuda", resolution_scale=1.0
+                       eval=False, llffhold=8):
     """
     dataset_path : folder containing `sparse/0/` and the images dir
     images_dir   : name of the folder with the actual photos (relative to dataset_path)
@@ -342,4 +343,3 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
 
     return points, point_colors, train_cameras, test_cameras
 
-    return points, point_colors, cameras
