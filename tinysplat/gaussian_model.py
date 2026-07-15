@@ -119,9 +119,21 @@ class GaussianModel:
 
     def training_setup(self, opt, spatial_lr_scale=1.0, camera_names=None, device="cuda"):
         self.spatial_lr_scale = spatial_lr_scale
-        self.optimizer = torch.optim.Adam([...])   # unchanged
-        self.xyz_scheduler_args = get_expon_lr_func(...)   # unchanged
-
+        l = [
+            {'params': [self.xyz], 'lr': opt.position_lr_init * spatial_lr_scale, 'name': 'xyz'},
+            {'params': [self.features_dc], 'lr': opt.feature_lr, 'name': 'f_dc'},
+            {'params': [self.features_rest], 'lr': opt.feature_lr / 20.0, 'name': 'f_rest'},
+            {'params': [self.opacity], 'lr': opt.opacity_lr, 'name': 'opacity'},
+            {'params': [self.scales], 'lr': opt.scaling_lr, 'name': 'scaling'},
+            {'params': [self.rotations], 'lr': opt.rotation_lr, 'name': 'rotation'},
+        ]
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.xyz_scheduler_args = get_expon_lr_func(
+            lr_init=opt.position_lr_init * spatial_lr_scale,
+            lr_final=opt.position_lr_final * spatial_lr_scale,
+            lr_delay_mult=opt.position_lr_delay_mult,
+            max_steps=opt.position_lr_max_steps,
+        )
         if camera_names is not None:
             self.create_exposure(camera_names, device=device)
             self.exposure_optimizer = torch.optim.Adam([self._exposure], lr=opt.exposure_lr_init)
