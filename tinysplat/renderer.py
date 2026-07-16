@@ -13,8 +13,8 @@ def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False):
         packed=False,
     )
 
-    meta["means2d"].retain_grad()   # must retain on the ORIGINAL, before slicing
-
+    if meta["means2d"].requires_grad:
+        meta["means2d"].retain_grad()
     radii = meta["radii"][0].max(dim=-1).values
     visibility_filter = radii > 0
     image = render_colors[0, ..., :3].permute(2, 0, 1)
