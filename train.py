@@ -18,9 +18,7 @@ from tinysplat.colmap_loader import load_colmap_scene
 pipe = PipelineParams()
 opt = OptimizationParams()
 dataset = ModelParams()
-dataset.source_path = "/path/to/your/colmap/dataset_undistorted"
-
-
+dataset.source_path = "/home/junior/splaterra/splaterra/tinysplat"
 wandb.init(
     project="3dgs-training",
     name=os.path.basename(dataset.source_path.rstrip("/")),
@@ -42,10 +40,10 @@ wandb.init(
         "depth_l1_weight_init": opt.depth_l1_weight_init,
         "depth_l1_weight_final": opt.depth_l1_weight_final,
         "random_background": opt.random_background,
-        "resume_checkpoint": checkpoint_path,
+        "resume_checkpoint": None,
     },
 )
-dataset.images = "images"
+dataset.images = "input"
 checkpoint_path = None
 
 
@@ -57,7 +55,7 @@ points, point_colors, train_cameras, test_cameras = load_colmap_scene(
     dataset_path=dataset.source_path,
 
     images_dir=dataset.images,
-    sparse_subdir="sparse",
+    sparse_subdir="sparse/0",
     device="cuda",
     eval=dataset.eval,
 )
@@ -146,9 +144,7 @@ for iteration in range(first_iteration,opt.iterations+1):
         bg = background
 
 
-<<<<<<< Updated upstream
     render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= False)
-=======
     render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= True)
     if iteration % 500 == 0:
         wandb.log(
@@ -158,7 +154,6 @@ for iteration in range(first_iteration,opt.iterations+1):
             },
             step=iteration,
         )
->>>>>>> Stashed changes
 
 
     # Loss Calculation
@@ -278,7 +273,6 @@ for iteration in range(first_iteration,opt.iterations+1):
         },
         f"checkpoints/checkpoint_{iteration}.pth"
         )
-<<<<<<< Updated upstream
     if iteration in testing_iterations and len(scene.getTestCameras()) > 0:
         l1_test = 0.0
         psnr_test = 0.0
@@ -297,7 +291,5 @@ for iteration in range(first_iteration,opt.iterations+1):
         l1_test /= len(test_cams)
         psnr_test /= len(test_cams)
         print(f"\n[ITER {iteration}] Eval — L1 {l1_test:.4f}  PSNR {psnr_test:.2f}")
-=======
 wandb.finish()
->>>>>>> Stashed changes
 

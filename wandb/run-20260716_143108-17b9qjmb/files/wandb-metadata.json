@@ -1,0 +1,40 @@
+{
+  "os": "Linux-6.8.0-134-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.20",
+  "startedAt": "2026-07-16T09:01:08.687172Z",
+  "program": "/home/junior/splaterra/splaterra/train.py",
+  "codePath": "train.py",
+  "codePathLocal": "train.py",
+  "git": {
+    "remote": "https://github.com/javAmeya/splaterra.git",
+    "commit": "f10f77ca58f48a5a5f42131425d21cc662e02676"
+  },
+  "email": "11.shah.harsh@gmail.com",
+  "root": "/home/junior/splaterra/splaterra",
+  "host": "omen",
+  "executable": "/home/junior/miniconda3/envs/3dgs/bin/python",
+  "cpu_count": 24,
+  "cpu_count_logical": 32,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "97528508416",
+      "used": "68128608256"
+    }
+  },
+  "memory": {
+    "total": "67087630336"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-8304397c-5241-754a-9e50-456c13dc0cb2"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "o8am8dmj602j1d43o81wy7zc362wpq88"
+}

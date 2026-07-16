@@ -1,0 +1,65 @@
+_wandb:
+    value:
+        cli_version: 0.28.0
+        e:
+            10dp30v4hb52f62zrcsg9af05nzobkk3:
+                codePath: train.py
+                codePathLocal: train.py
+                email: 11.shah.harsh@gmail.com
+                executable: /home/junior/miniconda3/envs/3dgs/bin/python
+                git:
+                    commit: f10f77ca58f48a5a5f42131425d21cc662e02676
+                    remote: https://github.com/javAmeya/splaterra.git
+                host: omen
+                os: Linux-6.8.0-134-generic-x86_64-with-glibc2.35
+                program: /home/junior/splaterra/splaterra/train.py
+                python: CPython 3.10.20
+                root: /home/junior/splaterra/splaterra
+                startedAt: "2026-07-16T08:46:35.433606Z"
+                writerId: 10dp30v4hb52f62zrcsg9af05nzobkk3
+        m: []
+        python_version: 3.10.20
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 16
+            "4": 3.10.20
+            "5": 0.28.0
+            "12": 0.28.0
+            "13": linux-x86_64
+densification_interval:
+    value: 100
+densify_from_iter:
+    value: 500
+densify_grad_threshold:
+    value: 0.0002
+densify_until_iter:
+    value: 15000
+depth_l1_weight_final:
+    value: 0.01
+depth_l1_weight_init:
+    value: 1
+images_dir:
+    value: images
+iterations:
+    value: 30000
+lambda_dssim:
+    value: 0.2
+opacity_cull:
+    value: 0.005
+opacity_reset_interval:
+    value: 3000
+random_background:
+    value: false
+resume_checkpoint:
+    value: null
+sh_degree:
+    value: 3
+source_path:
+    value: /tinysplat
+white_background:
+    value: false

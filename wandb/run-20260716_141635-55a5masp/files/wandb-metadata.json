@@ -1,0 +1,17 @@
+{
+  "os": "Linux-6.8.0-134-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.20",
+  "startedAt": "2026-07-16T08:46:35.433606Z",
+  "program": "/home/junior/splaterra/splaterra/train.py",
+  "codePath": "train.py",
+  "codePathLocal": "train.py",
+  "git": {
+    "remote": "https://github.com/javAmeya/splaterra.git",
+    "commit": "f10f77ca58f48a5a5f42131425d21cc662e02676"
+  },
+  "email": "11.shah.harsh@gmail.com",
+  "root": "/home/junior/splaterra/splaterra",
+  "host": "omen",
+  "executable": "/home/junior/miniconda3/envs/3dgs/bin/python",
+  "writerId": "10dp30v4hb52f62zrcsg9af05nzobkk3"
+}

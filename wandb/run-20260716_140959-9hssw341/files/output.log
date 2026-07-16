@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/junior/splaterra/splaterra/train.py", line 55, in <module>
+    points, point_colors, train_cameras, test_cameras = load_colmap_scene(
+  File "/home/junior/splaterra/splaterra/tinysplat/colmap_loader.py", line 287, in load_colmap_scene
+    raise FileNotFoundError(
+FileNotFoundError: No cameras.bin/txt found under /tinysplat/sparse. Check dataset_path/sparse_subdir.

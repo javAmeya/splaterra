@@ -1,0 +1,17 @@
+[33mgsplat: No CUDA toolkit found. gsplat will be disabled.[0m
+Traceback (most recent call last):
+  File "/home/junior/splaterra/splaterra/train.py", line 147, in <module>
+    render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= False)
+  File "/home/junior/splaterra/splaterra/tinysplat/renderer.py", line 4, in render
+    render_colors, alpha, meta = gsplat.rasterization(
+  File "/home/junior/miniconda3/envs/3dgs/lib/python3.10/site-packages/gsplat/rendering.py", line 409, in rasterization
+    proj_results = fully_fused_projection(
+  File "/home/junior/miniconda3/envs/3dgs/lib/python3.10/site-packages/gsplat/cuda/_wrapper.py", line 423, in fully_fused_projection
+    return _FullyFusedProjection.apply(
+  File "/home/junior/miniconda3/envs/3dgs/lib/python3.10/site-packages/torch/autograd/function.py", line 575, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+  File "/home/junior/miniconda3/envs/3dgs/lib/python3.10/site-packages/gsplat/cuda/_wrapper.py", line 1056, in forward
+    camera_model_type = _make_lazy_cuda_obj(
+  File "/home/junior/miniconda3/envs/3dgs/lib/python3.10/site-packages/gsplat/cuda/_wrapper.py", line 28, in _make_lazy_cuda_obj
+    obj = getattr(_C, name_split)
+AttributeError: 'NoneType' object has no attribute 'CameraModelType'
