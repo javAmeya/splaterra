@@ -315,12 +315,16 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
             K[0, 2] *= resolution_scale
             K[1, 2] *= resolution_scale
 
+        # ... inside load_colmap_scene ...
         image_path = os.path.join(dataset_path, images_dir, img.name)
         pil_image = PILImage.open(image_path).convert("RGB")
-        if resolution_scale != 1.0:
+
+# Force the resize to match COLMAP's recorded width/height
+        if pil_image.size != (width, height):
             pil_image = pil_image.resize((width, height), PILImage.LANCZOS)
 
         image_tensor = torch.from_numpy(np.array(pil_image)).float().permute(2, 0, 1) / 255.0
+# ...
         image_tensor = image_tensor.to(device)
 
         cam = TinySplatCamera(
