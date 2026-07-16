@@ -4,6 +4,7 @@ import os
 os.makedirs("checkpoints", exist_ok=True)
 
 import torch.nn.functional as L
+import wandb
 
 from tinysplat import Scene, GaussianModel
 from tinysplat.renderer import render
@@ -18,6 +19,32 @@ pipe = PipelineParams()
 opt = OptimizationParams()
 dataset = ModelParams()
 dataset.source_path = "/path/to/your/colmap/dataset_undistorted"
+
+
+wandb.init(
+    project="3dgs-training",
+    name=os.path.basename(dataset.source_path.rstrip("/")),
+    config={
+        # dataset
+        "source_path": dataset.source_path,
+        "images_dir": dataset.images,
+        "white_background": dataset.white_background,
+        "sh_degree": dataset.sh_degree,
+        # optimization params
+        "iterations": opt.iterations,
+        "densify_from_iter": opt.densify_from_iter,
+        "densify_until_iter": opt.densify_until_iter,
+        "densification_interval": opt.densification_interval,
+        "densify_grad_threshold": opt.densify_grad_threshold,
+        "opacity_cull": opt.opacity_cull,
+        "opacity_reset_interval": opt.opacity_reset_interval,
+        "lambda_dssim": opt.lambda_dssim,
+        "depth_l1_weight_init": opt.depth_l1_weight_init,
+        "depth_l1_weight_final": opt.depth_l1_weight_final,
+        "random_background": opt.random_background,
+        "resume_checkpoint": checkpoint_path,
+    },
+)
 dataset.images = "images"
 checkpoint_path = None
 
@@ -28,6 +55,7 @@ dataset.eval = True   # add this near your other dataset.* settings
 
 points, point_colors, train_cameras, test_cameras = load_colmap_scene(
     dataset_path=dataset.source_path,
+
     images_dir=dataset.images,
     sparse_subdir="sparse",
     device="cuda",
@@ -118,7 +146,19 @@ for iteration in range(first_iteration,opt.iterations+1):
         bg = background
 
 
+<<<<<<< Updated upstream
     render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= False)
+=======
+    render_pkg = render(viewpoint_camera=viewpoint_cam,pc=gaussians,pipe=pipe,bg_color=bg,use_trained_exp= True)
+    if iteration % 500 == 0:
+        wandb.log(
+            {
+                "render/image": wandb.Image(render_pkg["render"].detach().clamp(0, 1).cpu()),
+                "render/gt": wandb.Image(viewpoint_cam.original_image.detach().clamp(0, 1).cpu()),
+            },
+            step=iteration,
+        )
+>>>>>>> Stashed changes
 
 
     # Loss Calculation
@@ -161,6 +201,22 @@ for iteration in range(first_iteration,opt.iterations+1):
    
     loss.backward()
     
+    
+    # --- wandb logging ---
+    if iteration % 10 == 0:
+        num_gaussians = gaussians.xyz.shape[0]
+        log_dict = {
+            "train/loss": loss.item(),
+            "train/l1_loss": Ll1.item(),
+            "train/ssim": ssim_value.item(),
+            "train/num_gaussians": num_gaussians,
+            "train/depth_l1_weight": depth_l1_weight(iteration),
+            "lr/xyz": optimizer.param_groups[0]["lr"],  # adjust index if needed
+        }
+        if isinstance(depth_loss, torch.Tensor):
+            log_dict["train/depth_loss"] = depth_loss.item()
+        wandb.log(log_dict, step=iteration)
+    
 
     #  Densification 
 
@@ -182,6 +238,13 @@ for iteration in range(first_iteration,opt.iterations+1):
                     min_opacity=opt.opacity_cull,
                     extent=scene.cameras_extent,
                     max_screen_size=size_threshold,
+                )
+                wandb.log(
+                    {
+                        "densify/num_gaussians_after": gaussians.xyz.shape[0],
+                        "densify/mean_opacity": gaussians.get_opacity.mean().item(),
+                    },
+                    step=iteration,
                 )
 
     # Reset opacity periodically
@@ -206,6 +269,7 @@ for iteration in range(first_iteration,opt.iterations+1):
     if iteration % 100 == 0:
 
             print(f"\n[ITER {iteration}] Saving checkpoint")
+            
 
             torch.save({
             "iteration": iteration,
@@ -214,6 +278,7 @@ for iteration in range(first_iteration,opt.iterations+1):
         },
         f"checkpoints/checkpoint_{iteration}.pth"
         )
+<<<<<<< Updated upstream
     if iteration in testing_iterations and len(scene.getTestCameras()) > 0:
         l1_test = 0.0
         psnr_test = 0.0
@@ -232,4 +297,7 @@ for iteration in range(first_iteration,opt.iterations+1):
         l1_test /= len(test_cams)
         psnr_test /= len(test_cams)
         print(f"\n[ITER {iteration}] Eval — L1 {l1_test:.4f}  PSNR {psnr_test:.2f}")
+=======
+wandb.finish()
+>>>>>>> Stashed changes
 
