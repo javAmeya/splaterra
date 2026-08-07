@@ -2,3 +2,48 @@ __pycache__/
 results*/
 convert_ckpt_to_params.py
 *.pt
+tinysplat/output_3dgs
+tinysplat/sparse/0/
+tinysplat/tinysplat/checkpoints/
+
+__pycache__/
+
+# WandB
+wandb/
+wandb_logs/
+
+# Checkpoints
+*.pt
+checkpoints/
+train1/
+train1colmap_mech/
+
+# Generated models
+*.ply
+tinysplat/output/
+tinysplat/output_3dgs/
+tinysplat/checkpoints/
+tinysplat/checkpoint_ply/
+
+# Input / temporary data
+tinysplat/input/
+
+# COLMAP outputs
+tinysplat/sparse/
+colmap_mech/database.db
+
+# Demo videos
+tinysplat/house.mp4
+tinysplat/logervideo.mp4
+
+# LoGeR checkpoints
+LOGER/ckpts/**/*.pt
+
+
+
+# Misc
+results*/
+results_pi3/*.pt
+build_error*.log
+convert_ckpt_to_params.py
+
