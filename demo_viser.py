@@ -454,17 +454,18 @@ def main():
     target_resolution = args.resolution if args.resolution and len(args.resolution) == 2 else None
     
     # Generate seq_name automatically if not provided, similar to demo_viser.py
+    # Generate seq_name automatically if not provided, similar to demo_viser.py
     if args.seq_name is None:
         args.seq_name = os.path.basename(os.path.dirname(args.input)) + "_" + os.path.basename(args.input)
-        if args.input2:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input2))}_{os.path.basename(args.input2)}"
-        if args.input3:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input3))}_{os.path.basename(args.input3)}"
-        if args.input4:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input4))}_{os.path.basename(args.input4)}"
-        if args.input5:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input5))}_{os.path.basename(args.input5)}"
-       if args.wandb:
+    if args.input2:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input2))}_{os.path.basename(args.input2)}"
+    if args.input3:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input3))}_{os.path.basename(args.input3)}"
+    if args.input4:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input4))}_{os.path.basename(args.input4)}"
+    if args.input5:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input5))}_{os.path.basename(args.input5)}"
+    if args.wandb:
         wandb.init(
             project=args.wandb_project,
             group=args.exp_name,
@@ -483,8 +484,8 @@ def main():
                 "detach": args.detach,
                 "adaptive_features": args.adaptive_features,
                 "adaptive_metric_scaling": args.metric_scaling,
-                }
-            )
+            }
+        )
     
     if args.load:
         saved_predictions_path = args.load
@@ -513,7 +514,7 @@ def main():
                 predictions_dict = None 
         else:
             print(f"No pre-computed results found at {saved_predictions_path}. Proceeding with inference.")
-       ran_fresh_inference = predictions_dict is None
+        ran_fresh_inference = predictions_dict is None
 
     if predictions_dict is None:
         model = load_pi3_model(args.model_name, args.config, args.pi3x, args.pi3x_metric)
@@ -744,7 +745,7 @@ def main():
         # Using permute to get (B, S, H, W, C) for easier numpy conversion later
         raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2)
         raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
-         conf_np = raw_model_predictions['conf'].detach().cpu()
+        conf_np = raw_model_predictions['conf'].detach().cpu()
     else:
         conf_np = torch.from_numpy(predictions_dict['conf'])
     mean_conf = conf_np.mean().item()
@@ -856,7 +857,7 @@ def main():
         for temp_dir_path in temp_frame_dirs.values():
             if os.path.exists(temp_dir_path): shutil.rmtree(temp_dir_path)
             if args.wandb:
-            wandb.finish()
+                wandb.finish()
         return
 
     if args.skip_viser:

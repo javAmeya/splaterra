@@ -577,6 +577,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
+            attn_gate_scales,
         )
     
     def forward(self, imgs, *args, **kwargs):
@@ -662,7 +663,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
-        
+        per_window_gate_records = []
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
             if reset_every > 0 and window_idx > 0 and window_idx % reset_every == 0:
@@ -716,7 +717,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, _decode_attn_gate_scales = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -729,6 +730,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
                 if decode_avg_attn_gate_scale is not None:
                     all_attn_gate_scales.append(decode_avg_attn_gate_scale.detach().cpu())
+                per_window_gate_records.append({
+                    "window": window_idx,
+                    "ttt_per_layer": [g.detach().abs().mean().item() for g in _decode_gate_scales],
+                    "swa_per_layer": [g.detach().abs().mean().item() for g in _decode_attn_gate_scales],
+                })
+
 
                 # TODO: get the updated state from the ttt layer
                 if self.ttt_layers is not None and ttt_output_info is not None:
@@ -847,6 +854,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+        if all_gate_scales:
+            merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
+        if all_attn_gate_scales:
+            merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+        merged["per_window_gate_records"] = per_window_gate_records   # <-- add this
         
         return merged
 
