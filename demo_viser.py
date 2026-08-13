@@ -14,12 +14,13 @@ from PIL import Image
 from torchvision import transforms
 from natsort import natsorted
 from typing import List, Optional
-
+import wandb
 from pathlib import Path
 from loger.utils.rotation import mat_to_quat
 from loger.utils.geometry import depth_edge
 from loger.models.pi3 import Pi3
 from loger.utils.viser_utils import viser_wrapper
+from loger.utils.wandb_hooks import TTTSWACollector
 
 
 # Helper function to check if a path is a video file
@@ -127,6 +128,17 @@ parser.add_argument("--warmup", action="store_true", help="Run a warmup inferenc
 parser.add_argument("--benchmark", action="store_true", help="Run multiple inference passes and report timing statistics.")
 parser.add_argument("--load_to_cpu", action="store_true", default=True, help="Keep the preloaded image tensor on CPU (default; avoids GPU OOM on long sequences).")
 parser.add_argument("--no_load_to_cpu", action="store_false", dest='load_to_cpu', help="Move the preloaded image tensor onto the GPU before inference.")
+# --- wandb / ablation-tracking arguments ---
+parser.add_argument("--wandb", action="store_true", default=True, help="Enable Weights & Biases logging (default: True).")
+parser.add_argument("--no_wandb", action="store_false", dest="wandb", help="Disable Weights & Biases logging.")
+parser.add_argument("--wandb_project", type=str, default="LoGeR-Ablations", help="wandb project name.")
+parser.add_argument("--exp_name", type=str, default="default_exp", help="wandb group name, e.g. 'window_size'.")
+parser.add_argument("--run_name", type=str, default=None, help="wandb run name, e.g. 'window24'. Defaults to seq_name if omitted.")
+parser.add_argument("--revisit_state", action="store_true", help="[ablation flag] Revisit/reuse state across windows.")
+parser.add_argument("--solve_pose", action="store_true", help="[ablation flag] Solve for camera pose explicitly.")
+parser.add_argument("--detach", action="store_true", help="[ablation flag] Detach gradients/state between windows.")
+parser.add_argument("--adaptive_features", action="store_true", help="[ablation flag] Use adaptive feature selection.")
+parser.add_argument("--metric_scaling", action="store_true", help="[ablation flag] Use adaptive metric scaling.")
 
 def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: bool = False, pi3x_metric: bool = True):
     """Initializes the Pi3 model and loads weights."""
@@ -350,7 +362,30 @@ def _try_load_timestamps_for_images(image_paths, input_rgb_dir: Path):
 
     # 3) Fallback: sequential indices as timestamps
     return [float(i) for i in range(len(image_paths))]
+def compute_sim3_scale_stats(chunk_sim3_scales: Optional[torch.Tensor]):
+    """Reduce per-window-boundary relative Sim3 scales into two scalars:
 
+    - scale_drift = |log(prod over windows of relative_scale)|
+      Net multiplicative drift across the whole clip; 0 = no net drift.
+    - scale_jitter = std over windows of log(relative_scale)
+      Boundary-to-boundary inconsistency (log-space, not raw-value std).
+
+    With a single window (no boundaries, e.g. window_size >= N) there is
+    nothing to compare, so both are defined to be 0.0 -- this is the
+    Sweep-A sanity anchor.
+    """
+    if chunk_sim3_scales is None:
+        return None, None
+
+    s = chunk_sim3_scales.detach().float().flatten()
+    s = s[torch.isfinite(s) & (s > 0)]
+    if s.numel() == 0:
+        return 0.0, 0.0
+
+    log_s = torch.log(s)
+    scale_drift = log_s.sum().abs().item()
+    scale_jitter = log_s.std(unbiased=False).item() if s.numel() > 1 else 0.0
+    return scale_drift, scale_jitter
 
 def write_trajectory_txt(output_path: Path, timestamps, translations, quaternions):
     """Write trajectory file with lines: ts tx ty tz qx qy qz qw"""
@@ -419,16 +454,38 @@ def main():
     target_resolution = args.resolution if args.resolution and len(args.resolution) == 2 else None
     
     # Generate seq_name automatically if not provided, similar to demo_viser.py
+    # Generate seq_name automatically if not provided, similar to demo_viser.py
     if args.seq_name is None:
         args.seq_name = os.path.basename(os.path.dirname(args.input)) + "_" + os.path.basename(args.input)
-        if args.input2:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input2))}_{os.path.basename(args.input2)}"
-        if args.input3:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input3))}_{os.path.basename(args.input3)}"
-        if args.input4:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input4))}_{os.path.basename(args.input4)}"
-        if args.input5:
-            args.seq_name += f"_{os.path.basename(os.path.dirname(args.input5))}_{os.path.basename(args.input5)}"
+    if args.input2:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input2))}_{os.path.basename(args.input2)}"
+    if args.input3:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input3))}_{os.path.basename(args.input3)}"
+    if args.input4:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input4))}_{os.path.basename(args.input4)}"
+    if args.input5:
+        args.seq_name += f"_{os.path.basename(os.path.dirname(args.input5))}_{os.path.basename(args.input5)}"
+    if args.wandb:
+        wandb.init(
+            project=args.wandb_project,
+            group=args.exp_name,
+            name=args.run_name or args.seq_name,
+            config={
+                "window_size": args.window_size,
+                "overlap_size": args.overlap_size,
+                "ttt_reset": args.reset_every,
+                "use_ttt": not args.no_ttt,
+                "use_swa": not args.no_swa,
+                "sim3_mode": args.sim3_scale_mode,
+                "frame_stride": args.stride,
+                "resolution": args.resolution,
+                "revisit_state": args.revisit_state,
+                "solve_pose": args.solve_pose,
+                "detach": args.detach,
+                "adaptive_features": args.adaptive_features,
+                "adaptive_metric_scaling": args.metric_scaling,
+            }
+        )
     
     if args.load:
         saved_predictions_path = args.load
@@ -457,6 +514,7 @@ def main():
                 predictions_dict = None 
         else:
             print(f"No pre-computed results found at {saved_predictions_path}. Proceeding with inference.")
+        ran_fresh_inference = predictions_dict is None
 
     if predictions_dict is None:
         model = load_pi3_model(args.model_name, args.config, args.pi3x, args.pi3x_metric)
@@ -512,6 +570,9 @@ def main():
         print("Running inference...")
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
         num_frames = images_tensor.shape[0]
+        if args.wandb:
+            wandb.log({"num_frames": num_frames})
+
         
         forward_kwargs = {}
         if args.config:
@@ -535,6 +596,8 @@ def main():
                     'turn_off_swa': args.no_swa,
                 })
                 print(f"Forward pass kwargs from config: {forward_kwargs}")
+                if args.wandb:
+                    wandb.config.update(forward_kwargs, allow_val_change=True)
 
             except Exception as e:
                 print(f"Could not read config for forward pass arguments: {e}")
@@ -551,6 +614,7 @@ def main():
                 'sim3_scale_mode': args.sim3_scale_mode,
                 'reset_every': args.reset_every if args.reset_every is not None else 0
             })
+        collector = TTTSWACollector(model) if args.wandb else None
 
         # Warmup run to trigger torch.compile (first run has compilation overhead)
         if args.warmup or args.benchmark:
@@ -577,6 +641,11 @@ def main():
                 t_end = time.time()
                 inference_times.append(t_end - t_start)
                 print(f"  Run {run_idx + 1}/{num_runs}: {t_end - t_start:.3f}s")
+                if args.wandb:
+                    wandb.log({
+                        "benchmark/run": run_idx,
+                        "benchmark/time": t_end - t_start,
+                    })
             
             avg_time = sum(inference_times) / len(inference_times)
             min_time = min(inference_times)
@@ -592,10 +661,15 @@ def main():
             print(f"  Avg time per frame: {(avg_time / num_frames) * 1000:.2f} ms")
             print(f"{'='*50}\n")
             inference_time = avg_time
+            fps = num_frames / avg_time
+            ms_per_frame = (avg_time / num_frames) * 1000
+            infer_time_avg = avg_time
+            infer_time_std = std_time
         else:
             # Single timed inference
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
             inference_start_time = time.time()
             
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
@@ -618,11 +692,68 @@ def main():
             if not args.warmup:
                 print(f"  (Note: First run includes torch.compile overhead. Use --warmup for accurate timing)")
             print(f"{'='*50}\n")
+            infer_time_avg = inference_time
+            infer_time_std = 0.0
+
+        # peak_mem_mb applies to both benchmark and single-run paths
+        peak_mem_mb = 0
+        if torch.cuda.is_available():
+            peak_mem_mb = torch.cuda.max_memory_allocated() / (1024**2)
+
+        if args.wandb:
+            log_dict = {
+                "time_s": inference_time,
+                "fps": fps,
+                "ms_per_frame": ms_per_frame,
+                "peak_mem_mb": peak_mem_mb,
+                "infer_time_avg": infer_time_avg,
+                "infer_time_std": infer_time_std,
+            }
+
+            # avg_gate_scale / attn_gate_scale are computed by Pi3.forward and
+            # placed in the output dict already -- just log them.
+            if raw_model_predictions.get("avg_gate_scale") is not None:
+                log_dict["avg_gate_scale"] = raw_model_predictions["avg_gate_scale"].item()
+            if raw_model_predictions.get("attn_gate_scale") is not None:
+                log_dict["attn_gate_scale"] = raw_model_predictions["attn_gate_scale"].item()
+
+            # metric: global scale scalar, low-signal for these sweeps --
+            # logged only as a stability tripwire, not a Tier-1 readout.
+            metric_t = raw_model_predictions.get("metric")
+            if metric_t is not None and torch.is_tensor(metric_t) and metric_t.numel() > 0:
+                log_dict["metric_mean_tripwire"] = metric_t.detach().float().mean().item()
+
+            # scale_drift / scale_jitter, derived from the per-window-boundary
+            # relative Sim3 scale estimates (sim3 mode only). With a single
+            # window (window_size >= N) there are no boundaries to compare,
+            # so chunk_sim3_scales is absent from the output -- log 0.0
+            # explicitly rather than dropping the point, so the "collapses
+            # to 0 by construction" anchor actually shows up in the chart.
+            if forward_kwargs.get('sim3'):
+                scale_drift, scale_jitter = compute_sim3_scale_stats(
+                    raw_model_predictions.get("chunk_sim3_scales")
+                )
+                log_dict["scale_drift"] = scale_drift if scale_drift is not None else 0.0
+                log_dict["scale_jitter"] = scale_jitter if scale_jitter is not None else 0.0
+
+            wandb.log(log_dict)
+            if collector is not None:
+                collector.log_to_wandb()
+                collector.remove()
 
         # Post-process predictions
         # Using permute to get (B, S, H, W, C) for easier numpy conversion later
         raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2)
         raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
+        conf_np = raw_model_predictions['conf'].detach().cpu()
+    else:
+        conf_np = torch.from_numpy(predictions_dict['conf'])
+    mean_conf = conf_np.mean().item()
+    num_valid_points = (conf_np > args.conf_threshold / 100.0).sum().item()
+    conf_frac = num_valid_points / conf_np.numel() if conf_np.numel() > 0 else 0.0
+    if args.wandb:
+        wandb.log({"mean_conf": mean_conf, "num_valid_points": num_valid_points, "conf_frac": conf_frac})
+    if ran_fresh_inference:
         # Edge mask on depth can be noisy, optional
         # edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)
         # raw_model_predictions['conf'][edge] = 0.0
@@ -684,6 +815,9 @@ def main():
             # OR if the user provided a single input folder, we can try to be smarter.
             
             timestamps = None
+            input_paths_for_ts_check = [p for p in [args.input, args.input2, args.input3, args.input4, args.input5] if p is not None]
+            
+            
             if len(input_paths) == 1 and os.path.isdir(args.input) and not is_video_file(args.input):
                  # If single folder input, we can try to load timestamps using the original filenames
                  # Re-glob to get original paths
@@ -722,10 +856,14 @@ def main():
         print("Error: Predictions are not available. Exiting.")
         for temp_dir_path in temp_frame_dirs.values():
             if os.path.exists(temp_dir_path): shutil.rmtree(temp_dir_path)
+            if args.wandb:
+                wandb.finish()
         return
 
     if args.skip_viser:
         print("Skipping viser visualization.")
+        if args.wandb:
+            wandb.finish()
         return
 
     print("Starting viser visualization...")
@@ -748,6 +886,8 @@ def main():
             shutil.rmtree(temp_dir_path)
 
     print("Visualization setup complete. Server is running.")
+    if args.wandb:
+            wandb.finish()
 
 if __name__ == "__main__":
     main()

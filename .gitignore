@@ -46,4 +46,6 @@ results*/
 results_pi3/*.pt
 build_error*.log
 convert_ckpt_to_params.py
+data/examples/campus
+
 
