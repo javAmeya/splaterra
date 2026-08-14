@@ -23,7 +23,7 @@ class OptimizationParams:
         self.densify_until_iter = 15000
         self.densify_from_iter = 500
         self.densification_interval = 100
-        self.opacity_reset_interval = 40000
+        self.opacity_reset_interval = 4000
         self.densify_grad_threshold=0.00008
         self.opacity_cull=0.002
 
