@@ -14,7 +14,7 @@ testing_iterations = [3000, 4000, 7000, 15000, 24000, 30000]
 from tinysplat.params import OptimizationParams, PipelineParams, ModelParams
 from tinysplat.utils import get_expon_lr_func
 from tinysplat.colmap_loader import load_colmap_scene
- 
+from tinysplat.loger_loader import load_loger_scene
  
 pipe = PipelineParams()
 opt = OptimizationParams()
@@ -53,17 +53,19 @@ checkpoint_path = None
  
 dataset.eval = True
  
-points, point_colors, train_cameras, test_cameras = load_colmap_scene(
-    dataset_path=dataset.source_path,
-    images_dir=dataset.images,
-    sparse_subdir="sparse/0",
-    device="cuda",
-    eval=dataset.eval,
-)
- 
-scene = Scene(train_cameras=train_cameras, test_cameras=test_cameras)
+
  
 gaussians = GaussianModel(sh_degree=dataset.sh_degree)
+points, point_colors, train_cameras, test_cameras = load_loger_scene(
+    predictions_path="/loger/results_sweep/window_size_64.pt",
+    device="cuda",
+    conf_threshold=0.5,
+    subsample_stride=6,
+    eval=dataset.eval
+    max_frame=488,
+)
+print(f"[loger_loader] init point count: {points.shape[0]:,}  |  train cams: {len(train_cameras)}  test cams: {len(test_cameras)}")
+scene = Scene(train_cameras=train_cameras, test_cameras=test_cameras)
  
 if checkpoint_path is None:
     gaussians.create_from_pcd(
