@@ -454,13 +454,24 @@ def _assign_scene_relative_near_far(cameras, camera_poses, points,
           f"znear range=[{min(znears):.4g}, {max(znears):.4g}], "
           f"zfar range=[{min(zfars):.4g}, {max(zfars):.4g}] "
           f"(Camera defaults were a fixed znear=0.01, zfar=100.0 for all frames)")
+def _build_depth_supervision(frame_local_pts, frame_conf_mask, min_valid_px=1000, eps=1e-6):
+        z = frame_local_pts[..., 2]
+        valid = frame_conf_mask & np.isfinite(z) & (z > eps)
+
+        if valid.sum() < min_valid_px:
+            return None, None, False
+
+        safe_z = np.where(valid, z, 1.0)
+        invdepth = (1.0 / (safe_z + eps)).astype(np.float32)
+        mask = valid.astype(np.float32)
+        return invdepth, mask, True
 
 
 def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
                       subsample_stride=4, assumed_fov_deg=60.0,
                       eval=False, llffhold=8, voxel_size=None,
                       min_valid_px_for_K_fit=1000, max_frame=None,
-                      znear_min_frac=0.01, zfar_margin=1.3):
+                      znear_min_frac=0.01, zfar_margin=1,use_depth_supervision=True, min_valid_px_for_depth=1000):
     """
     predictions_path : .pt file saved by demo_viser.py's --output_folder
                         (dict of numpy-convertible tensors: points, conf,
@@ -588,6 +599,11 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
 
         image_tensor = torch.from_numpy(images[i]).float().permute(2, 0, 1)  # C,H,W
         image_tensor = image_tensor.to(device)
+        invdepth, depth_mask, depth_reliable = (None, None, False)
+        if use_depth_supervision:
+            invdepth, depth_mask, depth_reliable = _build_depth_supervision(
+                frame_local_pts, conf_mask, min_valid_px=min_valid_px_for_depth,
+            )
 
         cam = TinySplatCamera(
             view_matrix=torch.tensor(Tcw, dtype=torch.float32, device=device),
@@ -596,6 +612,9 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
             height=H,
             original_image=image_tensor,
             image_name=f"frame_{i:06d}",
+            invdepthmap=torch.tensor(invdepth, dtype=torch.float32, device=device) if invdepth is not None else None,
+            depth_mask=torch.tensor(depth_mask, dtype=torch.float32, device=device) if depth_mask is not None else None,
+            depth_reliable=depth_reliable,
         )
         cameras.append(cam)
 
