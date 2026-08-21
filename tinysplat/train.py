@@ -11,7 +11,7 @@ from tinysplat import Scene, GaussianModel
 from tinysplat.renderer import render
 from tinysplat.losses import ssim, psnr
 testing_iterations = [3000,4000,5000.6000,7000,8000,9000,10000,11000,12000,13000,14000,15000,16000,17000,18000,19000,20000,21000,22000,23000,24000,25000,26000,
-27000,28000,29000,30000]
+27000,28000,29000,30000,31000,32000,33000,34000,35000,36000,37000,38000,39000,40000,41000,42000,43000,44000,45000,46000,47000,48000,49000,50000,51000,52000,53000,54000,55000,56000,57000,58000,59000,60000]
 from tinysplat.params import OptimizationParams, PipelineParams, ModelParams
 from tinysplat.utils import get_expon_lr_func
 from tinysplat.colmap_loader import load_colmap_scene
@@ -61,11 +61,10 @@ points, point_colors, train_cameras, test_cameras = load_loger_scene(
     predictions_path="/loger/results_sweep/window_size_64.pt",
     device="cuda",
     conf_threshold=0.5,
-    subsample_stride=6,
+    subsample_stride=4,
     eval=dataset.eval,
     voxel_size=0.0017,
     use_depth_supervision=False,
-    max_frame=488
 )
 print(f"[loger_loader] init point count: {points.shape[0]:,}  |  train cams: {len(train_cameras)}  test cams: {len(test_cameras)}")
 scene = Scene(train_cameras=train_cameras, test_cameras=test_cameras)
