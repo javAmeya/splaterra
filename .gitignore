@@ -27,7 +27,7 @@ tinysplat/checkpoint_ply/
 
 # Input / temporary data
 tinysplat/input/
-
+val_images/
 # COLMAP outputs
 tinysplat/sparse/
 colmap_mech/database.db
