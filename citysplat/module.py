@@ -265,7 +265,7 @@ class CityGaussianModule(LightningModule):
         metrics, prog_bar = self.metric.get_validate_metrics(self, self.gaussian_model, batch, outputs)
         metrics_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in vars(metrics).items()}
         for key, value in metrics_dict.items():
-            self.log(f"{name}/{key}", value, on_step=False, on_epoch=True, add_dataloader_idx=False)
+            self.log(f"{name}/{key}", value, on_step=False, on_epoch=True, add_dataloader_idx=False, batch_size=1)
 
         self._val_metrics.append((camera.image_name, metrics_dict))
 

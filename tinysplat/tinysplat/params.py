@@ -5,7 +5,7 @@ class OptimizationParams:
 
     def __init__(self):
 
-        self.iterations = 60000
+        self.iterations = 30000
 
         self.lambda_dssim = 0.2
 
@@ -18,9 +18,9 @@ class OptimizationParams:
         self.feature_lr = 0.0025
 
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 60000
+        self.position_lr_max_steps = 30000
 
-        self.densify_until_iter = 40000
+        self.densify_until_iter = 15000
         self.densify_from_iter = 500
         self.densification_interval = 100
         self.opacity_reset_interval = 70000

@@ -470,6 +470,7 @@ def _build_depth_supervision(frame_local_pts, frame_conf_mask, min_valid_px=1000
 def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
                       subsample_stride=4, assumed_fov_deg=60.0,
                       eval=False, llffhold=8, voxel_size=None,
+                      use_voxelization=True,
                       min_valid_px_for_K_fit=1000, max_frame=None,
                       znear_min_frac=0.01, zfar_margin=1,use_depth_supervision=True, min_valid_px_for_depth=1000):
     """
@@ -653,10 +654,13 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
 
     # --- 3. Deduplicate overlapping-frame points via voxel downsampling ---
     n_before = points.shape[0]
-    vsize = voxel_size if voxel_size is not None else _estimate_voxel_size(points)
-    points, point_colors = _voxel_downsample(points, point_colors, voxel_size=vsize)
-    print(f"[loger_loader] voxel dedup (size={vsize:.5g}): {n_before:,} -> "
-          f"{points.shape[0]:,} points")
+    if use_voxelization:
+        vsize = voxel_size if voxel_size is not None else _estimate_voxel_size(points)
+        points, point_colors = _voxel_downsample(points, point_colors, voxel_size=vsize)
+        print(f"[loger_loader] voxel dedup (size={vsize:.5g}): {n_before:,} -> "
+              f"{points.shape[0]:,} points")
+    else:
+        print(f"[loger_loader] voxelization disabled -> keeping all {n_before:,} points")
 
     # --- 4. Set per-camera znear/zfar from actual scene geometry, instead of
     # leaving Camera's hardcoded defaults (znear=0.01, zfar=100.0) in place ---
