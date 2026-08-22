@@ -119,7 +119,7 @@ class Metric:
         image = outputs["render"].clamp(0, 1)
 
         l1 = F.l1_loss(image, gt_image)
-        psnr_value = psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
+        psnr_value = psnr(image.contiguous().unsqueeze(0), gt_image.contiguous().unsqueeze(0)).mean()
         ssim_value = ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
 
         metrics = SimpleNamespace(l1=l1, psnr=psnr_value, ssim=ssim_value)
