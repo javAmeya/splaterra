@@ -569,14 +569,28 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
     else:
         frame_is_test = np.zeros(S, dtype=bool)
 
-    # --- 1. Build per-frame Camera objects (with fitted/heuristic K each) ---
+    # --- 1a. FIRST PASS: fit K per-frame just to gather candidate fx/fy values.
+    # We then take the median across all successful fits and use ONE shared K
+    # for every frame, instead of trusting each frame's independent fit (or
+    # falling back to a fixed-FOV guess per-frame). This assumes a single
+    # physical camera/lens for the whole sequence -- true for one continuous
+    # video with no zoom changes. Per-frame fits were observed to be noisy
+    # (fx swinging ~226-383 across frames of the same lens), so pooling them
+    # into a median is a better estimate of the one true K than trusting any
+    # single frame's fit, and it also removes the need for the per-frame
+    # fixed-FOV fallback entirely.
     heuristic_K = _build_K_heuristic(W, H, fov_deg=assumed_fov_deg)
     n_fitted, n_fallback = 0, 0
+    fallback_frame_indices = []
+    fitted_fx, fitted_fy = [], []
 
-    cameras = []
+    frame_local_pts_cache = [None] * S
+    frame_conf_mask_cache = [None] * S
+
     for i in range(S):
         c = conf[i]  # (H, W)
         conf_mask = c > conf_threshold
+        frame_conf_mask_cache[i] = conf_mask
 
         Twc = camera_poses[i].astype(np.float32)  # camera -> world
         Tcw = np.linalg.inv(Twc)                   # world -> camera
@@ -585,16 +599,47 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
             frame_local_pts = _reconstruct_local_points(world_points[i], Tcw)
         else:
             frame_local_pts = local_points[i]
+        frame_local_pts_cache[i] = frame_local_pts
 
-        K = _fit_K_from_local_points(
+        K_i = _fit_K_from_local_points(
             frame_local_pts, conf_mask, W, H,
             min_valid_px=min_valid_px_for_K_fit,
         )
-        if K is not None:
+        if K_i is not None:
             n_fitted += 1
+            fitted_fx.append(float(K_i[0, 0]))
+            fitted_fy.append(float(K_i[1, 1]))
         else:
-            K = heuristic_K
             n_fallback += 1
+            fallback_frame_indices.append(i)
+
+    if fitted_fx:
+        median_fx = float(np.median(fitted_fx))
+        median_fy = float(np.median(fitted_fy))
+        shared_K = np.array(
+            [[median_fx, 0, W / 2.0], [0, median_fy, H / 2.0], [0, 0, 1]],
+            dtype=np.float32,
+        )
+        print(f"[loger_loader] using single shared K across all {S} frames "
+              f"(fx={median_fx:.1f}, fy={median_fy:.1f}), derived from median "
+              f"of {n_fitted} successful per-frame fits ({n_fallback} frames "
+              f"had no fit and now use this shared value too, instead of the "
+              f"{assumed_fov_deg}-deg heuristic).")
+    else:
+        shared_K = heuristic_K
+        print(f"[loger_loader] no per-frame K fits succeeded at all -- "
+              f"falling back to {assumed_fov_deg}-deg heuristic for all frames.")
+
+    # --- 1b. SECOND PASS: build Camera objects using the shared K for every frame ---
+    cameras = []
+    for i in range(S):
+        conf_mask = frame_conf_mask_cache[i]
+        frame_local_pts = frame_local_pts_cache[i]
+
+        Twc = camera_poses[i].astype(np.float32)  # camera -> world
+        Tcw = np.linalg.inv(Twc)                   # world -> camera
+
+        K = shared_K
         # tinysplat's Camera.view_matrix is world-to-camera (see colmap_loader.py,
         # where it's built directly from COLMAP's R/t which is also world-to-camera).
 
@@ -620,9 +665,14 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
         cameras.append(cam)
 
     source = "reconstructed local_points" if reconstructed_local else "saved local_points"
-    print(f"[loger_loader] intrinsics: fitted per-frame from {source} for "
-          f"{n_fitted}/{S} frames, fell back to {assumed_fov_deg}-deg heuristic "
-          f"for {n_fallback}/{S}")
+    print(f"[loger_loader] per-frame K fit diagnostics (from {source}, used only "
+          f"to derive the shared median K above, NOT applied per-frame anymore): "
+          f"{n_fitted}/{S} frames had a successful fit, {n_fallback}/{S} did not.")
+    print(f"[loger_loader] frames that had no successful fit: {fallback_frame_indices}")
+    if fitted_fx:
+        print(f"[loger_loader] fitted fx range: min={min(fitted_fx):.1f} "
+            f"max={max(fitted_fx):.1f} mean={np.mean(fitted_fx):.1f} "
+            f"std={np.std(fitted_fx):.1f}")
 
     train_cameras = [c for idx, c in enumerate(cameras) if not frame_is_test[idx]]
     test_cameras = [c for idx, c in enumerate(cameras) if frame_is_test[idx]]
