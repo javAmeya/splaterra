@@ -1,30 +1,47 @@
-# LoGeR: Long-Context Geometric Reconstruction with Hybrid Memory
+# **<h1 align="center">SPLATTERA</h1>**
 
-> **Notice: This is a reimplementation of LoGeR; complete code and models will be released upon approval.**
+Transforms a walkthrough video into a photorealistic, 
+interactive 3D environment by estimating camera poses with [LoGeR](https://arxiv.org/abs/2603.03269) ( Long Context Geometric Reconstruction ) and Using two training pipelines [3D Gaussian Splatting ](https://arxiv.org/pdf/2308.04079)and [CityGS](https://arxiv.org/html/2411.00771v1)  
 
-LoGeR processes long video streams in chunks with a hybrid memory design to improve large-scale geometric reconstruction quality and consistency.
+Colmap was used earlier for sparse point cloud and poses but Splattera replaces it with LoGeR.  
+LoGeR provides a dense point cloud  directly from raw video frames in a
+single forward pass.   
 
-[**LoGeR: Long-Context Geometric Reconstruction with Hybrid Memory**](https://arxiv.org/abs/2603.03269) [*Junyi Zhang*](https://junyi42.github.io/), [*Charles Herrmann*](https://scholar.google.com/citations?user=LQvi5XAAAAAJ), [*Junhwa Hur*](https://hurjunhwa.github.io/), [*Chen Sun*](https://chensun.me/index.html), [*Ming-Hsuan Yang*](https://faculty.ucmerced.edu/mhyang/), [*Forrester Cole*](https://scholar.google.com/citations?user=xZRRr-IAAAAJ&hl), [*Trevor Darrell*](https://people.eecs.berkeley.edu/~trevor/), [*Deqing Sun*](https://deqings.github.io/)
-| [**[Project Webpage]**](https://LoGeR-project.github.io/) | [**[arXiv]**](https://arxiv.org/abs/2603.03269)
+We are optimizing the 3D Gaussian Splatting for Large scenes.
+Splattera is built on top of LoGeR that integrates SOTA  3dgs that is scale and context optimised to loger’s point cloud priors and Citygs that supports large scene reconstruction using parallel block training 
 
-<p align="center">
-  <img src="https://loger-project.github.io/figs/fig1_teaser.png" alt="LoGeR Teaser" width="100%">
-</p>
+<img src="images/vjti.png" alt="vjti" width="700">  
+
 
 ## Installation
 
+Splattera supports two training pipelines — 
+3DGS and CityGS  
+
+## SETUP
+
+### Environment
+Create a single Conda environment as specified  
 ```bash
-git clone https://github.com/junyi42/LoGeR
-cd LoGeR
-conda create -n loger python=3.11 cmake=3.14.0
-conda activate loger
+conda create -n splaterra python=3.11 cmake=3.14.0
+conda activate splaterra
+ 
+```
+### 3DGS for Large Scenes 
+
+### CityGaussian
+
+```bash
+git clone https://github.com/javAmeya/splaterra
+cd splaterra
+git checkout main
 pip install -r requirements.txt
+pip install gsplat
 ```
 
 ## Checkpoint Download
 
-Checkpoints are hosted on [Hugging Face](https://huggingface.co/Junyi42/LoGeR):
-
+LoGeR checkpoints are hosted on [Hugging Face](https://huggingface.co/Junyi42/LoGeR).
 
 Please place files as:
 - `ckpts/LoGeR/latest.pt`
@@ -39,9 +56,40 @@ wget -O ckpts/LoGeR_star/latest.pt "https://huggingface.co/Junyi42/LoGeR/resolve
 
 ## Demo
 
-For demo usage, please directly refer to:
+For running LoGeR to get poses + point cloud, please directly refer to:
 
 - [`demo_run.sh`](demo_run.sh)
+
+## Training
+
+Splaterra supports two training pipelines on top of LoGeR's output:
+
+- **Vanilla 3D Gaussian Splatting** — [`tinysplat/train.py`](tinysplat/train.py)
+  Turns LoGeR's points and camera positions straight into a normal 3D scene, best for regular-sized scenes shot in one go. Uses LoGeR instead of Colmap
+- **CityGaussian** — [`train_citysplat.py`](train_citysplat.py)
+  Block wise large scene pipeline - Splits a huge scene into a grid of blocks , builds a rough version of scene first and then finetunes it
+
+## Diagnostics
+
+- [`diagnostic_reproject.py`](diagnostic_reproject.py) — It takes a camera from video and projects 3D points through it , if they trace the walls and the floors correctly then the cameras position is right  
+It is used to check the correctness of pose 
+  
+- [`demo_viser.py`](demo_viser.py) —  Runs LoGeR on your video and opens an interactive 3D viewer  where you can see the  whole reconstructed scene
+
+## Conversion to ply 
+
+**3DGS**  
+- [`convertply.sh`](convertply.sh) — convert pth to ply  
+ 
+ bash convertply.sh `iteration`.pth
+
+**CityGS**
+- [`ckpt_to_ply.py`](ckpt_to_ply.py) — export a trained checkpoint's
+  Gaussians to `.ply`  
+
+
+
+
 
 ## Evaluation
 
@@ -49,18 +97,10 @@ For evaluation instructions, please refer to:
 
 - [`eval/eval.md`](eval/eval.md)
 
-## Citation
-
-If you find our work useful, please cite:
-
-```bibtex
-@article{zhang2026loger,
-  title={LoGeR: Long-Context Geometric Reconstruction with Hybrid Memory},
-  author={Zhang, Junyi and Herrmann, Charles and Hur, Junhwa and Sun, Chen and Yang, Ming-Hsuan and Cole, Forrester and Darrell, Trevor and Sun, Deqing},
-  journal={arXiv preprint arXiv:2603.03269},
-  year={2026}
-}
-```
-
 ## Acknowledgments
-Our code is based on [Pi3](https://github.com/yyfz/Pi3) and [LaCT](https://github.com/a1600012888/LaCT), our camera pose estimation evaluation script is based on [TTT3R](https://github.com/Inception3D/TTT3R) & [VBR](https://github.com/rvp-group/vbr-slam-benchmark), and our visualization code is based on [Viser](https://github.com/nerfstudio-project/viser). We thank the authors for their excellent work!
+
+Built on [LoGeR](https://github.com/junyi42/LoGeR) (itself based on
+[Pi3](https://github.com/yyfz/Pi3) and [LaCT](https://github.com/a1600012888/LaCT)),
+[gsplat](https://github.com/nerfstudio-project/gsplat) for differentiable
+rasterization, and the original [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
+and [CityGaussian](https://github.com/DekuLiuTesla/CityGaussian) papers/codebases.
