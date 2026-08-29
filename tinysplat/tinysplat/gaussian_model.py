@@ -49,6 +49,16 @@ class GaussianModel:
         self.densify_size_threshold = None
         self.prune_size_threshold = None
 
+        # Position-anchoring bookkeeping (see compute_position_anchor_loss()).
+        # xyz_init holds each Gaussian's target position for the anchor loss;
+        # anchor_mask is True only for Gaussians that trace directly back to
+        # the init point cloud -- Gaussians created later by clone/split are
+        # NOT anchored (they have no point-cloud-prior position of their own
+        # to be pulled toward). Plain tensors, not nn.Parameters: they are a
+        # fixed regression target, never themselves optimized.
+        self.xyz_init = None
+        self.anchor_mask = None
+
         self.pretrained_exposures = None
         self.exposure_optimizer = None
 
@@ -98,6 +108,12 @@ class GaussianModel:
         self.max_radii2D = torch.zeros(n, device=device)
         self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
         self.denom = torch.zeros((n, 1), device=device)
+
+        # Every point-cloud-seeded Gaussian is anchored to its own init
+        # position; Gaussians added later via densification are not (see
+        # __init__ comment).
+        self.xyz_init = xyz.detach().clone()
+        self.anchor_mask = torch.ones(n, dtype=torch.bool, device=device)
 
     # --- activated properties ---
     @property
@@ -191,6 +207,22 @@ class GaussianModel:
             else opt.prune_size_multiplier * self.densify_size_threshold
         )
         return self.densify_size_threshold, self.prune_size_threshold
+
+    def compute_position_anchor_loss(self):
+        """Squared distance of each point-cloud-seeded Gaussian from its own
+        init position (mean over anchored points), or 0.0 if none remain
+        (e.g. every original point got pruned). Gaussians created later by
+        clone/split are excluded -- see anchor_mask in __init__.
+
+        Weight the result by a schedule (high early, decayed later) and add
+        to the training loss, so xyz keeps some pull back toward the point
+        cloud prior instead of drifting freely under photometric/depth
+        gradients alone.
+        """
+        if self.anchor_mask is None or not self.anchor_mask.any():
+            return torch.zeros((), device=self.xyz.device)
+        diff = self.xyz[self.anchor_mask] - self.xyz_init[self.anchor_mask]
+        return diff.pow(2).sum(-1).mean()
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -288,6 +320,8 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid]
         self.denom = self.denom[valid]
         self.max_radii2D = self.max_radii2D[valid]
+        self.xyz_init = self.xyz_init[valid]
+        self.anchor_mask = self.anchor_mask[valid]
 
     def _cat_tensors_to_optimizer(self, tensors_dict):
         result = {}
@@ -325,6 +359,18 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
         self.denom = torch.zeros((n, 1), device=device)
         self.max_radii2D = torch.zeros(n, device=device)
+
+        # New Gaussians from clone/split are not anchored (option (b) from
+        # the design discussion): they have no point-cloud-prior position of
+        # their own, so they're free to move under photometric/depth
+        # gradients alone. xyz_init entries for them are dummy/unused --
+        # anchor_mask=False means compute_position_anchor_loss() never reads
+        # them.
+        n_new = new_xyz.shape[0]
+        self.xyz_init = torch.cat([self.xyz_init, torch.zeros_like(new_xyz)], dim=0)
+        self.anchor_mask = torch.cat(
+            [self.anchor_mask, torch.zeros(n_new, dtype=torch.bool, device=device)], dim=0
+        )
 
     def _densify_and_clone(self, grads, grad_threshold, extent):
         selected = torch.where(grads.squeeze(-1) >= grad_threshold, True, False)
@@ -385,6 +431,8 @@ class GaussianModel:
             "features_rest": self.features_rest.detach().cpu(),
             "active_sh_degree": self.active_sh_degree,
             "point_scale": self.point_scale,
+            "xyz_init": self.xyz_init.detach().cpu() if self.xyz_init is not None else None,
+            "anchor_mask": self.anchor_mask.detach().cpu() if self.anchor_mask is not None else None,
         }
     def restore(self, state, device="cuda"):
         """
@@ -417,3 +465,17 @@ class GaussianModel:
         self.max_radii2D = torch.zeros(n, device=device)
         self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
         self.denom = torch.zeros((n, 1), device=device)
+
+        # Checkpoints saved before position anchoring existed won't have
+        # these keys -- fall back to "nothing anchored" rather than crash,
+        # since there's no original-point-cloud provenance to recover here.
+        xyz_init = state.get("xyz_init")
+        anchor_mask = state.get("anchor_mask")
+        if xyz_init is not None and anchor_mask is not None:
+            self.xyz_init = xyz_init.to(device)
+            self.anchor_mask = anchor_mask.to(device)
+        else:
+            print("[gaussian_model] checkpoint has no xyz_init/anchor_mask -- "
+                  "resuming with position anchoring disabled for all Gaussians.")
+            self.xyz_init = torch.zeros_like(self.xyz)
+            self.anchor_mask = torch.zeros(n, dtype=torch.bool, device=device)

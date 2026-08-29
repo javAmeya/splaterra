@@ -94,9 +94,14 @@ wandb.init(
         "densify_grad_threshold": opt.densify_grad_threshold,
         "opacity_cull": opt.opacity_cull,
         "opacity_reset_interval": opt.opacity_reset_interval,
+        "opacity_lr": opt.opacity_lr,
         "lambda_dssim": opt.lambda_dssim,
         "depth_l1_weight_init": opt.depth_l1_weight_init,
         "depth_l1_weight_final": opt.depth_l1_weight_final,
+        "densify_size_multiplier": opt.densify_size_multiplier,
+        "prune_size_multiplier": opt.prune_size_multiplier,
+        "position_anchor_weight_init": opt.position_anchor_weight_init,
+        "position_anchor_weight_final": opt.position_anchor_weight_final,
         "random_background": opt.random_background,
         "resume_checkpoint": None,
     },
@@ -198,6 +203,9 @@ background = torch.tensor(
 )
  
 depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+position_anchor_weight = get_expon_lr_func(
+    opt.position_anchor_weight_init, opt.position_anchor_weight_final, max_steps=opt.iterations
+)
  
  
 for iteration in range(first_iteration, opt.iterations + 1):
@@ -277,7 +285,14 @@ for iteration in range(first_iteration, opt.iterations + 1):
         depth_l1 = depth_l1_weight(iteration) * depth_loss
         loss += depth_l1
     # FIX #6: dropped unused 'Ll1depth = 0' dead var in else branch
- 
+
+    # Position anchoring: pull point-cloud-seeded Gaussians back toward
+    # their own init xyz (see GaussianModel.compute_position_anchor_loss);
+    # Gaussians created later by densification are excluded. Weight decays
+    # over training via the same expon_lr_func shape used for depth above.
+    position_anchor_loss = gaussians.compute_position_anchor_loss()
+    loss += position_anchor_weight(iteration) * position_anchor_loss
+
     # single guard var, computed once, reused below for backward() and step()
     # instead of checking `iteration < opt.iterations` twice
     apply_grad_step = iteration < opt.iterations
@@ -300,6 +315,8 @@ for iteration in range(first_iteration, opt.iterations + 1):
             "train/ssim": ssim_value.item(),
             "train/num_gaussians": num_gaussians,
             "train/depth_l1_weight": depth_l1_weight(iteration),
+            "train/position_anchor_loss": position_anchor_loss.item(),
+            "train/position_anchor_weight": position_anchor_weight(iteration),
             "lr/xyz": optimizer.param_groups[0]["lr"],  # adjust index if needed
         }
         if isinstance(depth_loss, torch.Tensor):
