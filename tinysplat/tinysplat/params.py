@@ -23,9 +23,24 @@ class OptimizationParams:
         self.densify_until_iter = 15000
         self.densify_from_iter = 500
         self.densification_interval = 100
-        self.opacity_reset_interval = 70000
+        self.opacity_reset_interval = 3000
         self.densify_grad_threshold=0.00008
         self.opacity_cull=0.002
+
+        # --- scale-invariant size gating ---
+        # The stock clone/split/prune size gates (0.01*extent / 0.1*extent) key
+        # off scene.cameras_extent, i.e. camera-trajectory span. That's fine for
+        # an orbit around a small object, but for a long walkthrough the same
+        # relative thresholds balloon with trajectory length even though the
+        # actual detail scale you want resolved (bricks, window frames) doesn't
+        # change. Setting these to None (default) makes GaussianModel derive an
+        # absolute size cap from the init point cloud's own local spacing
+        # instead (see GaussianModel.compute_size_thresholds) -- pass explicit
+        # values here to override that auto-estimate.
+        self.densify_size_threshold = None
+        self.prune_size_threshold = None
+        self.densify_size_multiplier = 20.0   # x median init-point spacing
+        self.prune_size_multiplier = 10.0     # x densify_size_threshold
 
 
 

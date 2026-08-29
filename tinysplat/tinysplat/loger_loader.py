@@ -51,8 +51,81 @@ Usage in train.py (replaces load_colmap_scene):
 import os
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
+from natsort import natsorted
+from PIL import Image
 
 from tinysplat.camera import Camera as TinySplatCamera
+
+
+def _extract_full_res_frames(video_path, num_frames, start_frame=0, stride=1, output_dir=None,
+                              target_size=None):
+    """Extract `num_frames` frames from video_path, in the exact same
+    start_frame/stride order LoGeR's own frame extraction used, so frame i
+    here lines up with frame i in the predictions (same pose, same depth).
+    Frames are written to disk (not returned as tensors) -- Camera objects
+    load them lazily on demand instead of holding all of them on GPU at once.
+
+    target_size : (W, H) to force-resize every frame to before saving.
+        LoGeR's own low-res frames are force-resized (not aspect-preserved)
+        from cv2's rotation-corrected decode to its own (W, H) -- if this
+        video has embedded rotation metadata, cv2 decodes it already-rotated,
+        but LoGeR's target resolution was computed assuming the raw *coded*
+        (pre-rotation) dimensions, so its frames end up non-uniformly
+        squished. For the per-axis K scaling in load_loger_scene to be valid,
+        these "full-res" frames must be squished the *same* way -- i.e.
+        force-resized to target_size, not just decoded at native resolution.
+        None = save at cv2's native (possibly rotation-corrected) decode size.
+
+    Cached: if output_dir already holds >= num_frames images, extraction is
+    skipped and the existing files are reused (avoids re-decoding the whole
+    video on every restart while iterating on the pod).
+    """
+    import cv2
+
+    if output_dir is None:
+        # Encode start_frame/stride/target_size in the cache dir name so a
+        # re-run with different alignment or a different forced resize can't
+        # silently reuse frames extracted under different settings.
+        size_tag = f"_r{target_size[0]}x{target_size[1]}" if target_size else ""
+        output_dir = f"{os.path.splitext(video_path)[0]}_fullres_frames_s{start_frame}_x{stride}{size_tag}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    existing = natsorted(
+        p for p in os.listdir(output_dir) if p.lower().endswith(".png")
+    )
+    if len(existing) >= num_frames:
+        return [os.path.join(output_dir, p) for p in existing[:num_frames]]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video {video_path}")
+
+    paths = []
+    idx = 0
+    saved = 0
+    while saved < num_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx >= start_frame and (idx - start_frame) % stride == 0:
+            if target_size is not None:
+                frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
+            p = os.path.join(output_dir, f"frame_{saved:06d}.png")
+            cv2.imwrite(p, frame)
+            paths.append(p)
+            saved += 1
+        idx += 1
+    cap.release()
+
+    if saved < num_frames:
+        raise RuntimeError(
+            f"Only extracted {saved} full-res frames from {video_path} but "
+            f"predictions has {num_frames} -- check full_res_start_frame/"
+            f"full_res_stride match whatever start_frame/stride LoGeR's "
+            f"inference used, so frames stay index-aligned with the poses."
+        )
+    return paths
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +265,64 @@ def _voxel_downsample(points, colors, voxel_size):
     out_pts = (sum_pts / counts[:, None]).astype(np.float32)
     out_cols = (sum_cols / counts[:, None]).astype(np.float32)
     return out_pts, out_cols
+
+
+def _adaptive_voxel_downsample(points, colors, voxel_size, min_neighbors=2,
+                               density_radius=None, workers=-1):
+    """Voxel-dedup only where the point cloud is actually dense enough for
+    it to make sense; leave sparse regions untouched.
+
+    Plain voxel dedup assumes there's redundant coverage to merge -- true
+    for near geometry (many overlapping frames see the same wall), false
+    for far geometry (per-pixel point density falls off ~1/depth^2, so
+    distant surfaces are already point-starved before dedup ever runs).
+    Applying the same voxel grid everywhere then thins the sparse regions
+    further on top of their inherent sparsity, which shows up after
+    training as patchy/foggy or missing far geometry.
+
+    For each point, count how many *other* points fall within one
+    voxel-width of it (a direct measurement of "would voxelizing this point
+    actually merge it with anything"). Points with >= min_neighbors get
+    voxel-downsampled as a group; everything else -- i.e. points already
+    isolated at roughly one-voxel spacing or sparser -- passes through
+    unmodified, keeping every point that region has.
+
+    points, colors : (N, 3) arrays, same N
+    voxel_size      : same voxel size that will be used for the dedup pass
+    min_neighbors   : minimum other points within `density_radius` for a
+                      point to be classified "dense" (default 2, i.e. dedup
+                      only kicks in where there's a real cluster, not just a
+                      coincidental pair)
+    density_radius  : radius (scene units) used for the dense/sparse
+                      classification. None -> use voxel_size (the historical
+                      behavior). Shrinking it below voxel_size makes the
+                      "dense" test stricter, so fewer points get voxelized
+                      and more are passed through untouched.
+    Returns (points, colors) with dense regions deduped and sparse regions
+    passed through, plus the (n_dense, n_sparse) point counts for logging.
+    """
+    if points.shape[0] == 0:
+        return points, colors, (0, 0)
+
+    if density_radius is None:
+        density_radius = voxel_size
+
+    tree = cKDTree(points)
+    # return_length=True avoids materializing per-point neighbor-index lists
+    # for what can be millions of points -- just the counts. Includes the
+    # point itself, hence the -1 below.
+    neighbor_counts = tree.query_ball_point(points, r=density_radius, return_length=True, workers=workers) - 1
+
+    dense_mask = neighbor_counts >= min_neighbors
+    dense_pts, dense_cols = points[dense_mask], colors[dense_mask]
+    sparse_pts, sparse_cols = points[~dense_mask], colors[~dense_mask]
+
+    if dense_pts.shape[0] > 0:
+        dense_pts, dense_cols = _voxel_downsample(dense_pts, dense_cols, voxel_size=voxel_size)
+
+    out_pts = np.concatenate([dense_pts, sparse_pts], axis=0)
+    out_cols = np.concatenate([dense_cols, sparse_cols], axis=0)
+    return out_pts, out_cols, (int(dense_mask.sum()), int((~dense_mask).sum()))
 
 
 def _infer_chunk_frame_ranges(num_frames, num_chunks, window_size, overlap):
@@ -470,9 +601,12 @@ def _build_depth_supervision(frame_local_pts, frame_conf_mask, min_valid_px=1000
 def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
                       subsample_stride=4, assumed_fov_deg=60.0,
                       eval=False, llffhold=8, voxel_size=None,
-                      use_voxelization=True,
+                      use_voxelization=True, voxelize_min_neighbors=2,
+                      voxelize_density_radius=None,
                       min_valid_px_for_K_fit=1000, max_frame=None,
-                      znear_min_frac=0.01, zfar_margin=1,use_depth_supervision=True, min_valid_px_for_depth=1000):
+                      znear_min_frac=0.01, zfar_margin=1,use_depth_supervision=True, min_valid_px_for_depth=1000,
+                      full_res_video_path=None, full_res_start_frame=0, full_res_stride=1,
+                      full_res_frames_dir=None, full_res_target_size=None):
     """
     predictions_path : .pt file saved by demo_viser.py's --output_folder
                         (dict of numpy-convertible tensors: points, conf,
@@ -487,6 +621,19 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
                          point cloud. If None, auto-estimated as ~0.3% of the
                          scene's bounding-box diagonal. Pass explicitly if
                          the auto estimate looks too aggressive/loose.
+    voxelize_min_neighbors : dedup is applied per-point, not globally -- a
+                         point only gets voxel-merged if it has at least
+                         this many other points within one voxel_size of it
+                         (i.e. the region around it is actually dense).
+                         Points below this (already sparse, e.g. far-away
+                         geometry where per-pixel point density has fallen
+                         off) are kept as-is instead of being thinned
+                         further by dedup. See _adaptive_voxel_downsample().
+    voxelize_density_radius : radius (scene units) for the dense/sparse
+                         classification. None -> use voxel_size. Decrease it
+                         to make the dense test stricter so fewer points are
+                         voxelized (more points survive, especially at the
+                         edges of dense clusters).
     min_valid_px_for_K_fit : minimum confident, in-front-of-camera pixels
                          required to trust a per-frame intrinsics fit;
                          frames with fewer fall back to the FOV heuristic.
@@ -499,6 +646,22 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
                          floor for znear as a fraction of scene radius.
     zfar_margin         : passed to _assign_scene_relative_near_far() --
                          multiplier applied to zfar for headroom.
+    full_res_video_path : if set, train/test Cameras render at higher
+                         resolution instead of the (low-res) LoGeR inference
+                         resolution -- geometry/poses/depth still come from
+                         LoGeR, only the photometric image + K change. Frames
+                         are cached to disk and loaded lazily per-camera (not
+                         held on GPU all at once). Must be the same video
+                         LoGeR ran on, extracted with the same
+                         full_res_start_frame/full_res_stride LoGeR used, so
+                         frame i stays aligned with predictions[i]'s pose.
+    full_res_target_size : (W, H) to force-resize full-res frames to. Must
+                         match whatever (possibly non-uniform) squish LoGeR's
+                         own resolution implicitly assumed -- pass None only
+                         if you've confirmed LoGeR's target resolution truly
+                         preserves this video's aspect ratio (no embedded
+                         rotation metadata silently changing cv2's decoded
+                         orientation vs what LoGeR's resolution assumed).
 
     Returns: (points [N,3] float32 np.array,
               point_colors [N,3] float32 np.array in [0,1],
@@ -631,6 +794,20 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
               f"falling back to {assumed_fov_deg}-deg heuristic for all frames.")
 
     # --- 1b. SECOND PASS: build Camera objects using the shared K for every frame ---
+    full_res_paths = None
+    full_res_W = full_res_H = None
+    if full_res_video_path is not None:
+        full_res_paths = _extract_full_res_frames(
+            full_res_video_path, num_frames=S,
+            start_frame=full_res_start_frame, stride=full_res_stride,
+            output_dir=full_res_frames_dir, target_size=full_res_target_size,
+        )
+        with Image.open(full_res_paths[0]) as first:
+            full_res_W, full_res_H = first.size
+        print(f"[loger_loader] full-res training images: {full_res_W}x{full_res_H} "
+              f"(LoGeR geometry resolution stays {W}x{H}); K scaled "
+              f"x{full_res_W / W:.3g}/x{full_res_H / H:.3g}.")
+
     cameras = []
     for i in range(S):
         conf_mask = frame_conf_mask_cache[i]
@@ -643,8 +820,23 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
         # tinysplat's Camera.view_matrix is world-to-camera (see colmap_loader.py,
         # where it's built directly from COLMAP's R/t which is also world-to-camera).
 
-        image_tensor = torch.from_numpy(images[i]).float().permute(2, 0, 1)  # C,H,W
-        image_tensor = image_tensor.to(device)
+        if full_res_paths is not None:
+            # Photometric supervision at native resolution; geometry (points,
+            # poses, depth) stays whatever LoGeR ran at. K scales linearly
+            # with the resolution change -- fx/cx by the width ratio, fy/cy
+            # by the height ratio.
+            cam_width, cam_height = full_res_W, full_res_H
+            K = K.copy()
+            K[0, 0] *= full_res_W / W
+            K[0, 2] *= full_res_W / W
+            K[1, 1] *= full_res_H / H
+            K[1, 2] *= full_res_H / H
+            image_kwargs = dict(original_image=None, image_path=full_res_paths[i], device=device)
+        else:
+            cam_width, cam_height = W, H
+            image_tensor = torch.from_numpy(images[i]).float().permute(2, 0, 1).to(device)  # C,H,W
+            image_kwargs = dict(original_image=image_tensor)
+
         invdepth, depth_mask, depth_reliable = (None, None, False)
         if use_depth_supervision:
             invdepth, depth_mask, depth_reliable = _build_depth_supervision(
@@ -654,10 +846,10 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
         cam = TinySplatCamera(
             view_matrix=torch.tensor(Tcw, dtype=torch.float32, device=device),
             K=torch.tensor(K, dtype=torch.float32, device=device),
-            width=W,
-            height=H,
-            original_image=image_tensor,
+            width=cam_width,
+            height=cam_height,
             image_name=f"frame_{i:06d}",
+            **image_kwargs,
             invdepthmap=torch.tensor(invdepth, dtype=torch.float32, device=device) if invdepth is not None else None,
             depth_mask=torch.tensor(depth_mask, dtype=torch.float32, device=device) if depth_mask is not None else None,
             depth_reliable=depth_reliable,
@@ -702,13 +894,24 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
     if point_colors.max() > 1.0 + 1e-3:
         point_colors = point_colors / 255.0
 
-    # --- 3. Deduplicate overlapping-frame points via voxel downsampling ---
+    # --- 3. Deduplicate overlapping-frame points via voxel downsampling,
+    # but only where the point cloud is locally dense enough for dedup to
+    # make sense -- sparse regions (e.g. far-away geometry) pass through
+    # untouched instead of being thinned further. See
+    # _adaptive_voxel_downsample() docstring for why.
     n_before = points.shape[0]
     if use_voxelization:
         vsize = voxel_size if voxel_size is not None else _estimate_voxel_size(points)
-        points, point_colors = _voxel_downsample(points, point_colors, voxel_size=vsize)
-        print(f"[loger_loader] voxel dedup (size={vsize:.5g}): {n_before:,} -> "
-              f"{points.shape[0]:,} points")
+        drad = voxelize_density_radius if voxelize_density_radius is not None else vsize
+        points, point_colors, (n_dense, n_sparse) = _adaptive_voxel_downsample(
+            points, point_colors, voxel_size=vsize, min_neighbors=voxelize_min_neighbors,
+            density_radius=drad,
+        )
+        print(f"[loger_loader] adaptive voxel dedup (size={vsize:.5g}, "
+              f"density_radius={drad:.5g}, "
+              f"min_neighbors={voxelize_min_neighbors}): {n_before:,} points -> "
+              f"{n_dense:,} dense (deduped) + {n_sparse:,} sparse (kept as-is) "
+              f"= {points.shape[0]:,} total")
     else:
         print(f"[loger_loader] voxelization disabled -> keeping all {n_before:,} points")
 

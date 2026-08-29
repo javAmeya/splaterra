@@ -40,6 +40,15 @@ class GaussianModel:
         self.optimizer = None
         self.xyz_scheduler_args = None
 
+        # Absolute (extent-independent) size gates for densify/prune -- see
+        # compute_size_thresholds(). None until create_from_pcd/restore sets
+        # point_scale and compute_size_thresholds() is called; the gating
+        # methods fall back to the old extent-relative formula while None, so
+        # nothing breaks for callers (e.g. citysplat) that never call it.
+        self.point_scale = None
+        self.densify_size_threshold = None
+        self.prune_size_threshold = None
+
         self.pretrained_exposures = None
         self.exposure_optimizer = None
 
@@ -64,6 +73,12 @@ class GaussianModel:
 
         dist2_tensor = torch.tensor(mean_dist2, dtype=torch.float32, device=device)
         scales = torch.log(torch.sqrt(dist2_tensor))[..., None].repeat(1, 3)  # (N, 3)
+
+        # Median (not mean, so a handful of sparse/far-away points can't skew
+        # it) local point spacing across the whole init cloud -- the basis for
+        # an absolute, trajectory-independent densify/prune size cap. See
+        # compute_size_thresholds().
+        self.point_scale = float(np.median(np.sqrt(mean_dist2)))
 
         rotations = torch.zeros((n, 4), device=device)
         rotations[:, 0] = 1.0  # identity quaternion (w=1)
@@ -145,6 +160,38 @@ class GaussianModel:
                 max_steps=opt.iterations,
             )
 
+    def compute_size_thresholds(self, opt):
+        """Derive absolute densify/prune size caps from the init point
+        cloud's own local spacing (self.point_scale), instead of the stock
+        0.01*extent / 0.1*extent formula that keys off camera-trajectory
+        span. A 100m walkthrough shouldn't get 100x looser size gating than
+        a 1m tabletop orbit just because the camera moved farther -- the
+        physical detail scale you want resolved (bricks, window frames)
+        doesn't change with trajectory length, so the gate shouldn't either.
+
+        opt.densify_size_threshold / opt.prune_size_threshold, if set
+        explicitly, override the auto-estimate. Must be called after
+        create_from_pcd() or restore() (both set self.point_scale) -- call
+        again after restore() too, since point_scale isn't part of the
+        optimizer state.
+        """
+        if self.point_scale is None:
+            raise RuntimeError(
+                "compute_size_thresholds() requires self.point_scale, which "
+                "is set by create_from_pcd() or restore(). Call one of those "
+                "first."
+            )
+
+        self.densify_size_threshold = (
+            opt.densify_size_threshold if opt.densify_size_threshold is not None
+            else opt.densify_size_multiplier * self.point_scale
+        )
+        self.prune_size_threshold = (
+            opt.prune_size_threshold if opt.prune_size_threshold is not None
+            else opt.prune_size_multiplier * self.densify_size_threshold
+        )
+        return self.densify_size_threshold, self.prune_size_threshold
+
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
@@ -184,7 +231,8 @@ class GaussianModel:
         prune_mask = (self.get_opacity <= min_opacity).squeeze(-1)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_size_cap = self.prune_size_threshold if self.prune_size_threshold is not None else 0.1 * extent
+            big_points_ws = self.get_scaling.max(dim=1).values > prune_size_cap
             prune_mask = prune_mask | big_points_vs | big_points_ws
         self._prune_points(prune_mask)
 
@@ -280,7 +328,8 @@ class GaussianModel:
 
     def _densify_and_clone(self, grads, grad_threshold, extent):
         selected = torch.where(grads.squeeze(-1) >= grad_threshold, True, False)
-        selected &= self.get_scaling.max(dim=1).values <= 0.01 * extent
+        size_cap = self.densify_size_threshold if self.densify_size_threshold is not None else 0.01 * extent
+        selected &= self.get_scaling.max(dim=1).values <= size_cap
 
         new_xyz = self.xyz[selected]
         new_scales = self.scales[selected]
@@ -298,7 +347,8 @@ class GaussianModel:
         padded_grad[:grads.shape[0]] = grads.squeeze(-1)
 
         selected = padded_grad >= grad_threshold
-        selected &= self.get_scaling.max(dim=1).values > 0.01 * extent
+        size_cap = self.densify_size_threshold if self.densify_size_threshold is not None else 0.01 * extent
+        selected &= self.get_scaling.max(dim=1).values > size_cap
 
         stds = self.get_scaling[selected].repeat(n_split, 1)
         means = torch.zeros((stds.size(0), 3), device=self.xyz.device)
@@ -334,6 +384,7 @@ class GaussianModel:
             "features_dc": self.features_dc.detach().cpu(),
             "features_rest": self.features_rest.detach().cpu(),
             "active_sh_degree": self.active_sh_degree,
+            "point_scale": self.point_scale,
         }
     def restore(self, state, device="cuda"):
         """
@@ -360,6 +411,7 @@ class GaussianModel:
             state["features_rest"].to(device).requires_grad_(True))
 
         self.active_sh_degree = state["active_sh_degree"]
+        self.point_scale = state.get("point_scale")
 
         n = self.xyz.shape[0]
         self.max_radii2D = torch.zeros(n, device=device)
