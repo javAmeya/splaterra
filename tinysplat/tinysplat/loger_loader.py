@@ -614,9 +614,10 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
     conf_threshold    : drop points with conf below this before init
     subsample_stride  : take every Nth pixel (flattened) to keep point count
                          sane for gaussians.create_from_pcd
-    assumed_fov_deg    : fallback FOV for K, only used for frames where
-                         local_points isn't available or the per-frame fit
-                         fails its sanity check
+    assumed_fov_deg    : UNUSED. K is now a hardcoded constant (see the
+                         "1a." block in the function body) rather than fit
+                         or heuristically derived per-frame -- kept as a
+                         param only for call-site compatibility.
     voxel_size         : voxel size (scene units) for deduplicating the fused
                          point cloud. If None, auto-estimated as ~0.3% of the
                          scene's bounding-box diagonal. Pass explicitly if
@@ -634,9 +635,8 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
                          to make the dense test stricter so fewer points are
                          voxelized (more points survive, especially at the
                          edges of dense clusters).
-    min_valid_px_for_K_fit : minimum confident, in-front-of-camera pixels
-                         required to trust a per-frame intrinsics fit;
-                         frames with fewer fall back to the FOV heuristic.
+    min_valid_px_for_K_fit : UNUSED for the same reason as assumed_fov_deg
+                         above -- kept only for call-site compatibility.
     max_frame           : if set, only frames [0, max_frame) are used --
                          everything else is dropped before any other
                          processing. Use this to cut off a chunked LoGeR
@@ -732,20 +732,62 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
     else:
         frame_is_test = np.zeros(S, dtype=bool)
 
-    # --- 1a. FIRST PASS: fit K per-frame just to gather candidate fx/fy values.
-    # We then take the median across all successful fits and use ONE shared K
-    # for every frame, instead of trusting each frame's independent fit (or
-    # falling back to a fixed-FOV guess per-frame). This assumes a single
-    # physical camera/lens for the whole sequence -- true for one continuous
-    # video with no zoom changes. Per-frame fits were observed to be noisy
-    # (fx swinging ~226-383 across frames of the same lens), so pooling them
-    # into a median is a better estimate of the one true K than trusting any
-    # single frame's fit, and it also removes the need for the per-frame
-    # fixed-FOV fallback entirely.
-    heuristic_K = _build_K_heuristic(W, H, fov_deg=assumed_fov_deg)
-    n_fitted, n_fallback = 0, 0
-    fallback_frame_indices = []
-    fitted_fx, fitted_fy = [], []
+    # --- 1a. FIRST PASS: no per-frame fitting anymore -- shared_K below is a
+    # HARDCODED constant (not derived from this sequence's data via fitting).
+    # Per-frame fitted fx was observed to swing ~226-383 px across frames of
+    # the same physical lens, and even the median-pooled estimate was still a
+    # fit, i.e. still sensitive to conf-mask noise / local_points quality.
+    #
+    # This value is instead derived from the SOURCE VIDEO's own embedded
+    # QuickTime lens metadata (exiftool -a -G1 -s inference_2_.mov):
+    #   CameraLensModel                : iPhone 14 back camera 1.54mm f/2.4
+    #   CameraFocalLength35mmEquivalent: 13mm
+    #   Coded resolution                : 1920x1080, rotated -90deg
+    #     (i.e. true captured orientation is portrait 1080x1920)
+    #
+    # Derivation (see chat log for the full walkthrough):
+    #   1. crop_factor = 13 / 1.54 = 8.44
+    #      sensor_diagonal = 43.27mm (35mm-format ref) / 8.44 = 5.13mm
+    #      -> assuming native 4:3 sensor aspect: sensor is ~4.10 x 3.08mm
+    #      (sanity check: implies ~118deg diagonal FOV, matching Apple's
+    #      commonly-quoted "120deg ultrawide" spec -- consistent)
+    #   2. Video crops the 4:3 sensor to 16:9 (keeps full width, crops
+    #      top/bottom): video_height = 4.10 * 9/16 = 2.31mm
+    #        HFOV_video (sensor width axis)  = 2*atan((4.10/2)/1.54) ~= 106.1deg
+    #        VFOV_video (sensor height axis) = 2*atan((2.31/2)/1.54) ~= 73.7deg
+    #   3. The -90deg rotation swaps axes for our portrait W x H frames:
+    #      frame width (short, W) <-> sensor height axis (73.7deg)
+    #      frame height (long, H) <-> sensor width axis  (106.1deg)
+    #      fx = (W/2) / tan(73.7deg/2)
+    #      fy = (H/2) / tan(106.1deg/2)
+    #   Evaluated at this dataset's actual 266x476 (W x H): fx~=177.5,
+    #   fy~=179.1 -- within ~1% of each other, which is itself a consistency
+    #   check on the square-pixel assumption. Using their mean below.
+    #
+    # cx, cy are still computed from W, H rather than hardcoded, since the
+    # principal point is just "image center" by convention, not a measured
+    # lens property -- only fx/fy are the actual hardcoded constants here.
+    #
+    # CAVEATS:
+    #   - This is a pinhole approximation; the ultrawide lens has real
+    #     radial (barrel) distortion this K does not model.
+    #   - Assumes no digital-zoom change and no video-stabilization crop
+    #     during capture -- stabilization would narrow the true FOV below
+    #     the 106.1/73.7deg used here, making this fx an underestimate.
+    #   - Recompute if you re-run on footage from a different phone/lens/
+    #     resolution -- this constant is specific to this iPhone 14 back
+    #     ultrawide camera at this dataset's 266x476 resolution.
+    HARDCODED_FX = 178.3
+    HARDCODED_FY = 178.3
+    shared_K = np.array(
+        [[HARDCODED_FX, 0, W / 2.0], [0, HARDCODED_FY, H / 2.0], [0, 0, 1]],
+        dtype=np.float32,
+    )
+    print(f"[loger_loader] using HARDCODED shared K for all {S} frames "
+          f"(fx={HARDCODED_FX:.1f}, fy={HARDCODED_FY:.1f}, cx={W/2.0:.1f}, "
+          f"cy={H/2.0:.1f}) -- derived from inference_2_.mov's embedded lens "
+          f"metadata (iPhone 14 back ultrawide, 1.54mm f/2.4) at {W}x{H}, "
+          f"NOT fit from this sequence's per-frame data.")
 
     frame_local_pts_cache = [None] * S
     frame_conf_mask_cache = [None] * S
@@ -763,35 +805,6 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
         else:
             frame_local_pts = local_points[i]
         frame_local_pts_cache[i] = frame_local_pts
-
-        K_i = _fit_K_from_local_points(
-            frame_local_pts, conf_mask, W, H,
-            min_valid_px=min_valid_px_for_K_fit,
-        )
-        if K_i is not None:
-            n_fitted += 1
-            fitted_fx.append(float(K_i[0, 0]))
-            fitted_fy.append(float(K_i[1, 1]))
-        else:
-            n_fallback += 1
-            fallback_frame_indices.append(i)
-
-    if fitted_fx:
-        median_fx = float(np.median(fitted_fx))
-        median_fy = float(np.median(fitted_fy))
-        shared_K = np.array(
-            [[median_fx, 0, W / 2.0], [0, median_fy, H / 2.0], [0, 0, 1]],
-            dtype=np.float32,
-        )
-        print(f"[loger_loader] using single shared K across all {S} frames "
-              f"(fx={median_fx:.1f}, fy={median_fy:.1f}), derived from median "
-              f"of {n_fitted} successful per-frame fits ({n_fallback} frames "
-              f"had no fit and now use this shared value too, instead of the "
-              f"{assumed_fov_deg}-deg heuristic).")
-    else:
-        shared_K = heuristic_K
-        print(f"[loger_loader] no per-frame K fits succeeded at all -- "
-              f"falling back to {assumed_fov_deg}-deg heuristic for all frames.")
 
     # --- 1b. SECOND PASS: build Camera objects using the shared K for every frame ---
     full_res_paths = None
@@ -857,14 +870,8 @@ def load_loger_scene(predictions_path, device="cuda", conf_threshold=0.5,
         cameras.append(cam)
 
     source = "reconstructed local_points" if reconstructed_local else "saved local_points"
-    print(f"[loger_loader] per-frame K fit diagnostics (from {source}, used only "
-          f"to derive the shared median K above, NOT applied per-frame anymore): "
-          f"{n_fitted}/{S} frames had a successful fit, {n_fallback}/{S} did not.")
-    print(f"[loger_loader] frames that had no successful fit: {fallback_frame_indices}")
-    if fitted_fx:
-        print(f"[loger_loader] fitted fx range: min={min(fitted_fx):.1f} "
-            f"max={max(fitted_fx):.1f} mean={np.mean(fitted_fx):.1f} "
-            f"std={np.std(fitted_fx):.1f}")
+    print(f"[loger_loader] local_points source: {source}. K is hardcoded "
+          f"(see above) -- no per-frame fitting is performed anymore.")
 
     train_cameras = [c for idx, c in enumerate(cameras) if not frame_is_test[idx]]
     test_cameras = [c for idx, c in enumerate(cameras) if frame_is_test[idx]]
