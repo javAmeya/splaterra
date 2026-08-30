@@ -109,7 +109,7 @@ parser.add_argument(
     help="Name of the model to load from Hugging Face Hub or a local path to a checkpoint."
 )
 parser.add_argument("--config", type=str, default="ckpts/LoGeR_star/original_config.yaml", help="Path to a yaml config file for model initialization.")
-parser.add_argument("--resolution", type=list, default=None, help="Target resolution for input images (shorter side).")
+parser.add_argument("--resolution", type=int, nargs=2, default=None, help="Target resolution (W H) for input images.")
 parser.add_argument("--window_size", type=int, default=32, help="Window size for non-causal inference (-1 for full sequence).")
 parser.add_argument("--overlap_size", type=int, default=3, help="Overlap size for sliding window inference.")
 parser.add_argument("--sim3", action="store_true", help="Use sim3 transformation for TTT.")
@@ -448,6 +448,7 @@ def main():
         raise FileNotFoundError(f"Checkpoint file not found: {args.model_name}")
 
     predictions_dict = None
+    ran_fresh_inference = True  # overwritten below if --load succeeds in reusing a cached result
     temp_frame_dirs = {}
     input_indices = {}
     image_folder_for_sky = None

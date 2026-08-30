@@ -17,7 +17,7 @@ wandb_logs/
 checkpoints/
 train1/
 train1colmap_mech/
-
+checkpoints_citygaussian/
 # Generated models
 *.ply
 tinysplat/output/
@@ -27,7 +27,7 @@ tinysplat/checkpoint_ply/
 
 # Input / temporary data
 tinysplat/input/
-
+val_images/
 # COLMAP outputs
 tinysplat/sparse/
 colmap_mech/database.db
@@ -47,5 +47,5 @@ results_pi3/*.pt
 build_error*.log
 convert_ckpt_to_params.py
 data/examples/campus
-
+data/examples/house/
 
