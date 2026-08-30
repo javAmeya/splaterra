@@ -10,7 +10,7 @@ single forward pass.
 We are optimizing the 3D Gaussian Splatting for Large scenes.
 Splattera is built on top of LoGeR that integrates SOTA  3dgs that is scale and context optimised to loger’s point cloud priors and Citygs that supports large scene reconstruction using parallel block training 
 
-<img src="images/allinone.png" alt="ALL" width="700">  
+<img src="images/vjti.png" alt="vjti" width="700">  
 
 
 ## Installation
