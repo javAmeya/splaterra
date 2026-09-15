@@ -448,6 +448,12 @@ def main():
         raise FileNotFoundError(f"Checkpoint file not found: {args.model_name}")
 
     predictions_dict = None
+    # Default for the no-`--load` (fresh inference) path -- only the `--load`
+    # branch below re-derives this from whether a cached .pt was found. Was
+    # previously unset on this path, so the `if ran_fresh_inference:` block
+    # further down (which does the numpy conversion + --output_folder save)
+    # raised UnboundLocalError and no results ever got saved.
+    ran_fresh_inference = True
     temp_frame_dirs = {}
     input_indices = {}
     image_folder_for_sky = None

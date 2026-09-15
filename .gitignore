@@ -48,4 +48,13 @@ build_error*.log
 convert_ckpt_to_params.py
 data/examples/campus
 
+# macOS
+.DS_Store
+
+# Local pod result artifacts (.ply/.log pulled from a training pod) -- not source, not reproducible-on-clone
+pod_results/
+
+# Demo/input videos at repo root
+inference.mov
+
 

@@ -85,6 +85,21 @@ def qvec2rotmat(qvec):
          1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2]])
 
 
+def rotmat2qvec(R):
+    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = np.asarray(R, dtype=np.float64).flat
+    K = np.array([
+        [Rxx - Ryy - Rzz, 0, 0, 0],
+        [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
+        [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
+        [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz],
+    ]) / 3.0
+    eigvals, eigvecs = np.linalg.eigh(K)
+    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
+    if qvec[0] < 0:
+        qvec *= -1
+    return qvec
+
+
 def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     data = fid.read(num_bytes)
     return struct.unpack(endian_character + format_char_sequence, data)
@@ -204,6 +219,51 @@ def read_extrinsics_binary(path_to_model_file):
     return images
 
 
+# ---------------------------------------------------------------------------
+# Binary model writers (counterparts to the readers above). Used by
+# loger_to_colmap.py to write a synthetic COLMAP model directly from LoGeR's
+# poses/pointmap, without running COLMAP itself.
+# ---------------------------------------------------------------------------
+
+def write_cameras_binary(cameras, path):
+    """cameras: dict[camera_id] -> {"model": "PINHOLE", "width", "height", "params": [fx,fy,cx,cy]}"""
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", len(cameras)))
+        for camera_id, cam in cameras.items():
+            model_id = CAMERA_MODEL_NAMES[cam["model"]].model_id
+            fid.write(struct.pack("<ii", camera_id, model_id))
+            fid.write(struct.pack("<QQ", cam["width"], cam["height"]))
+            params = cam["params"]
+            fid.write(struct.pack(f"<{len(params)}d", *params))
+
+
+def write_images_binary(images, path):
+    """images: dict[image_id] -> {"qvec": (4,), "tvec": (3,), "camera_id", "name"}. Written with
+    zero 2D keypoints/track correspondences, since tinysplat's colmap_loader never reads them."""
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", len(images)))
+        for image_id, img in images.items():
+            fid.write(struct.pack("<i", image_id))
+            fid.write(struct.pack("<4d", *[float(v) for v in img["qvec"]]))
+            fid.write(struct.pack("<3d", *[float(v) for v in img["tvec"]]))
+            fid.write(struct.pack("<i", img["camera_id"]))
+            fid.write(img["name"].encode("utf-8") + b"\x00")
+            fid.write(struct.pack("<Q", 0))  # num_points2D = 0
+
+
+def write_points3D_binary(xyz, rgb, path):
+    """xyz: (N,3) float, rgb: (N,3) uint8. Written with empty tracks (no 2D observations)."""
+    n = xyz.shape[0]
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", n))
+        for i in range(n):
+            fid.write(struct.pack("<Q", i))
+            fid.write(struct.pack("<3d", *[float(v) for v in xyz[i]]))
+            fid.write(struct.pack("<3B", *[int(v) for v in rgb[i]]))
+            fid.write(struct.pack("<d", 1.0))  # error (unused downstream)
+            fid.write(struct.pack("<Q", 0))    # track_length = 0
+
+
 def read_extrinsics_text(path):
     images = {}
     with open(path, "r") as fid:
@@ -253,17 +313,64 @@ def _colmap_params_to_K(model, params):
 
 
 # ---------------------------------------------------------------------------
+# Scene-adaptive near/far planes
+# ---------------------------------------------------------------------------
+
+def _estimate_scene_depth_range(points, R_list, t_list, near_pct=0.5, far_pct=99.5,
+                                 near_margin=0.5, far_margin=1.5, sample_size=20000,
+                                 min_near=1e-3):
+    """
+    gsplat's rasterizer (and tinysplat.camera.Camera's old hardcoded
+    znear=0.01/zfar=100.0 defaults) hard-culls any Gaussian whose projected
+    depth falls outside [near_plane, far_plane] from BOTH rendering and
+    densification gradient accumulation. Those constants were tuned for
+    room-scale COLMAP captures; LoGeR/DUSt3R-style pointmaps are reconstructed
+    in an arbitrary, per-scene scale (see loger/utils/geometry.py's
+    robust_scale_estimation), so a fixed 100.0 silently truncates geometry in
+    scenes larger (or smaller) than that. Instead, derive near/far from the
+    actual depth distribution of the scene's own points as seen by its own
+    cameras, using percentiles (not raw min/max) so a handful of noisy
+    outlier points can't blow the range up or clip it down.
+    """
+    if len(points) > sample_size:
+        idx = np.random.choice(len(points), sample_size, replace=False)
+        pts = points[idx]
+    else:
+        pts = points
+
+    depths = []
+    for R, t in zip(R_list, t_list):
+        d = pts @ R[2, :] + t[2]
+        depths.append(d)
+    depths = np.concatenate(depths)
+    depths = depths[depths > 0]  # keep only points in front of each camera
+
+    if depths.size == 0:
+        return 0.01, 100.0
+
+    near = max(min_near, float(np.percentile(depths, near_pct)) * near_margin)
+    far = float(np.percentile(depths, far_pct)) * far_margin
+    if far <= near:
+        far = near * 100.0
+    return near, far
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0",
                        device="cuda", resolution_scale=1.0,
-                       eval=False, llffhold=8):
+                       eval=False, llffhold=8, depths_dir="depths"):
     """
     dataset_path : folder containing `sparse/0/` and the images dir
     images_dir   : name of the folder with the actual photos (relative to dataset_path)
     sparse_subdir: which COLMAP reconstruction to use (usually "sparse/0")
     resolution_scale: e.g. 0.5 to downsample images/intrinsics by half
+    depths_dir   : optional folder of per-image `<stem>.npz` files with `invdepth`/`mask`
+                   arrays (written by loger_to_colmap.py) for depth supervision. Silently
+                   skipped per-image if the folder or a given file doesn't exist, so this
+                   works unchanged on plain-COLMAP datasets with no depth data at all.
 
     Returns: (points [N,3] float32 np.array,
               point_colors [N,3] float32 np.array in [0,1],
@@ -293,12 +400,15 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
     point_colors = (rgbs.astype(np.float32)) / 255.0
 
     cameras = []
+    all_R, all_t = [], []
     for image_id in sorted(cam_extrinsics.keys()):
         img = cam_extrinsics[image_id]
         cam_info = cam_intrinsics[img.camera_id]
 
         R = qvec2rotmat(img.qvec)
         t = img.tvec.reshape(3, 1)
+        all_R.append(R)
+        all_t.append(t.reshape(3))
 
         view_matrix = np.eye(4, dtype=np.float32)
         view_matrix[:3, :3] = R
@@ -327,6 +437,19 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
 # ...
         image_tensor = image_tensor.to(device)
 
+        invdepthmap, depth_mask, depth_reliable = None, None, False
+        depth_stem = os.path.splitext(img.name)[0]
+        depth_path = os.path.join(dataset_path, depths_dir, depth_stem + ".npz")
+        if os.path.exists(depth_path):
+            depth_npz = np.load(depth_path)
+            invdepth_np, mask_np = depth_npz["invdepth"], depth_npz["mask"]
+            if resolution_scale != 1.0 or invdepth_np.shape != (height, width):
+                invdepth_np = np.array(PILImage.fromarray(invdepth_np).resize((width, height), PILImage.NEAREST))
+                mask_np = np.array(PILImage.fromarray(mask_np).resize((width, height), PILImage.NEAREST))
+            invdepthmap = torch.tensor(invdepth_np, dtype=torch.float32, device=device)
+            depth_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
+            depth_reliable = bool(mask_np.mean() > 0.01)  # skip frames with essentially no valid depth at all
+
         cam = TinySplatCamera(
             view_matrix=torch.tensor(view_matrix, dtype=torch.float32, device=device),
             K=torch.tensor(K, dtype=torch.float32, device=device),
@@ -334,9 +457,18 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
             height=height,
             original_image=image_tensor,
             image_name=img.name,
+            invdepthmap=invdepthmap,
+            depth_mask=depth_mask,
+            depth_reliable=depth_reliable,
         )
-        
+
         cameras.append(cam)
+
+    znear, zfar = _estimate_scene_depth_range(points, all_R, all_t)
+    print(f"[load_colmap_scene] scene-adaptive near/far planes: znear={znear:.6g} zfar={zfar:.6g}")
+    for cam in cameras:
+        cam.znear = znear
+        cam.zfar = zfar
 
     if eval:
         train_cameras = [c for idx, c in enumerate(cameras) if idx % llffhold != 0]

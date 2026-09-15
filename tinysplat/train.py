@@ -14,13 +14,14 @@ testing_iterations = [3000, 4000, 7000, 15000, 24000, 30000]
 from tinysplat.params import OptimizationParams, PipelineParams, ModelParams
 from tinysplat.utils import get_expon_lr_func
 from tinysplat.colmap_loader import load_colmap_scene
+from tinysplat.pose_correction import PoseCorrection
  
  
 pipe = PipelineParams()
 opt = OptimizationParams()
 dataset = ModelParams()
-dataset.source_path = "/home/junior/splaterra/tinysplat"
-dataset.images = "input"
+dataset.source_path = "/workspace/splaterra/data/inference_run"
+dataset.images = "images"
 
 wandb.init(
     project="3dgs-training",
@@ -62,7 +63,14 @@ points, point_colors, train_cameras, test_cameras = load_colmap_scene(
 )
  
 scene = Scene(train_cameras=train_cameras, test_cameras=test_cameras)
- 
+
+wandb.config.update({
+    "cameras_extent": scene.cameras_extent,
+    "znear": train_cameras[0].znear,
+    "zfar": train_cameras[0].zfar,
+    "num_init_points": points.shape[0],
+})
+
 gaussians = GaussianModel(sh_degree=dataset.sh_degree)
  
 if checkpoint_path is None:
@@ -98,7 +106,13 @@ gaussians.training_setup(
 )
  
 optimizer = gaussians.optimizer
- 
+
+# Differentiable per-camera pose correction -- an ML alternative to running
+# actual COLMAP bundle adjustment (see tinysplat/pose_correction.py and
+# docs/pose_correction_method.md) for LoGeR's cross-frame pose inconsistency.
+# Train-camera-only by design -- see pose_correction.py's docstring.
+pose_corr = PoseCorrection([c.image_name for c in train_cameras], device=device, max_steps=opt.iterations)
+
 if checkpoint_path is not None:
     optimizer.load_state_dict(checkpoint["optimizer"])
  
@@ -117,6 +131,7 @@ depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weigh
 for iteration in range(first_iteration, opt.iterations + 1):
  
     gaussians.update_learning_rate(iteration)
+    pose_corr.update_learning_rate(iteration)
  
     if iteration % 1000 == 0:
         gaussians.oneupSHdegree()
@@ -138,7 +153,24 @@ for iteration in range(first_iteration, opt.iterations + 1):
  
     # FIX #3: was called twice (use_trained_exp=False then True) — first call was
     # pure waste (~2x forward cost), second call always overwrote it. Keep one call only.
-    render_pkg = render(viewpoint_camera=viewpoint_cam, pc=gaussians, pipe=pipe, bg_color=bg, use_trained_exp=True)
+    #
+    # FIX #9 (supersedes NOTE #4 below, which argued True was intentional):
+    # training with use_trained_exp=True let the optimizer minimize the
+    # training loss by dumping appearance/geometry errors into each image's
+    # learned per-view exposure correction instead of fixing the actual
+    # Gaussians -- checkpoints never save that correction (see
+    # GaussianModel.capture()), so none of that "fit" is recoverable, and a
+    # deployed/novel-view render can never have a per-view correction to
+    # apply anyway. Measured on a real large-scene run: L1 WITH exposure fell
+    # smoothly 0.283->0.079 over 30k iters while L1 WITHOUT exposure (what
+    # eval/.ply actually show) reversed after iter ~4000 and finished worse
+    # than it started (0.164->0.304). Train with the same view the model will
+    # ultimately be judged/deployed with, so there's no train/eval mismatch
+    # for the optimizer to exploit. (This may matter less on a small,
+    # densely-orbited capture where many views constrain the same surface --
+    # revisit per-scene if exposure correction is ever actually needed.)
+    corrected_vm = pose_corr.corrected_view_matrix(viewpoint_cam.view_matrix, viewpoint_cam.image_name)
+    render_pkg = render(viewpoint_camera=viewpoint_cam, pc=gaussians, pipe=pipe, bg_color=bg, use_trained_exp=False, view_matrix=corrected_vm)
  
     if iteration % 500 == 0:
         wandb.log(
@@ -198,6 +230,9 @@ for iteration in range(first_iteration, opt.iterations + 1):
     # --- wandb logging ---
     if iteration % 10 == 0:
         num_gaussians = gaussians.xyz.shape[0]
+        with torch.no_grad():
+            scaling = gaussians.get_scaling
+            opacity = gaussians.get_opacity
         log_dict = {
             "train/loss": loss.item(),
             "train/l1_loss": Ll1.item(),
@@ -205,7 +240,23 @@ for iteration in range(first_iteration, opt.iterations + 1):
             "train/num_gaussians": num_gaussians,
             "train/depth_l1_weight": depth_l1_weight(iteration),
             "lr/xyz": optimizer.param_groups[0]["lr"],  # adjust index if needed
+            "lr/pose_corr": pose_corr.optimizer.param_groups[0]["lr"],
+            # Diagnostics for floater/scale-blowup tracking: if these trend
+            # up while train/ssim trends down, densification is likely the
+            # culprit rather than the optimizer or the initialization.
+            "gaussians/mean_scale": scaling.mean().item(),
+            "gaussians/max_scale": scaling.max().item(),
+            "gaussians/mean_opacity": opacity.mean().item(),
+            "gaussians/frac_low_opacity": (opacity < opt.opacity_cull).float().mean().item(),
+            # Fraction of Gaussians visible (radius>0, i.e. inside the
+            # near/far frustum and non-degenerate) in THIS view. If this
+            # stays chronically low relative to num_gaussians, densification
+            # is spending budget on Gaussians most views never see/correct.
+            "gaussians/frac_visible_this_view": render_pkg["visibility_filter"].float().mean().item(),
         }
+        pose_rot_mag, pose_trans_mag = pose_corr.correction_magnitude()
+        log_dict["pose_corr/mean_rotation_rad"] = pose_rot_mag
+        log_dict["pose_corr/mean_translation"] = pose_trans_mag
         if isinstance(depth_loss, torch.Tensor):
             log_dict["train/depth_loss"] = depth_loss.item()
         wandb.log(log_dict, step=iteration)
@@ -228,7 +279,7 @@ for iteration in range(first_iteration, opt.iterations + 1):
             )
             if (iteration > opt.densify_from_iter
                     and iteration % opt.densification_interval == 0):
-                size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                size_threshold = 20 if iteration > opt.size_prune_from_iter else None
                 gaussians.densify_and_prune(
                     max_grad=opt.densify_grad_threshold,
                     min_opacity=opt.opacity_cull,
@@ -257,6 +308,7 @@ for iteration in range(first_iteration, opt.iterations + 1):
         if gaussians.exposure_optimizer is not None:
             gaussians.exposure_optimizer.step()
             gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+        pose_corr.step()
  
     # Checkpoints
     if iteration % 6000 == 0 or iteration ==3000:
@@ -276,10 +328,10 @@ for iteration in range(first_iteration, opt.iterations + 1):
         test_cams = scene.getTestCameras()
         with torch.no_grad():
             for test_cam in test_cams:
-                # NOTE (#4): use_trained_exp=False here vs True during training is
-                # intentional, not a bug — the exported PLY has no exposure params,
-                # so eval/PSNR is measured the same way the final PLY will actually
-                # render. Kept as-is; flagged here so it isn't "fixed" by accident.
+                # NOTE (#4, updated by FIX #9): training now also renders with
+                # use_trained_exp=False (see above), so this matches training
+                # rather than diverging from it -- both match what the
+                # exported PLY actually produces.
                 render_pkg_test = render(
                     viewpoint_camera=test_cam, pc=gaussians, pipe=pipe,
                     bg_color=background, use_trained_exp=False,
@@ -292,5 +344,30 @@ for iteration in range(first_iteration, opt.iterations + 1):
         l1_test /= len(test_cams)
         psnr_test /= len(test_cams)
         print(f"\n[ITER {iteration}] Eval — L1 {l1_test:.4f}  PSNR {psnr_test:.2f}")
- 
+
+        # DIAGNOSTIC: training renders use_trained_exp=True (line ~141), but
+        # every eval above (and the exported .ply) uses False -- checkpoints
+        # never save the exposure module at all (see GaussianModel.capture()).
+        # If the optimizer is reducing the *training* loss by pushing
+        # appearance errors into the per-image exposure correction rather
+        # than into genuinely correct Gaussian color/geometry, train loss can
+        # keep improving while every exposure-free eval (this one included)
+        # gets steadily worse -- with no way to recover the "with exposure"
+        # fit after the fact, since it's discarded at save time. Compare the
+        # two L1 numbers directly on the same train subsample to check.
+        train_sample = scene.getTrainCameras()[::max(1, len(scene.getTrainCameras()) // 30)][:30]
+        l1_train_with_exp, l1_train_no_exp = 0.0, 0.0
+        with torch.no_grad():
+            for cam in train_sample:
+                gt = torch.clamp(cam.original_image, 0.0, 1.0)
+                cam_vm = pose_corr.corrected_view_matrix(cam.view_matrix, cam.image_name)
+                img_with = torch.clamp(render(viewpoint_camera=cam, pc=gaussians, pipe=pipe, bg_color=background, use_trained_exp=True, view_matrix=cam_vm)["render"], 0.0, 1.0)
+                img_no = torch.clamp(render(viewpoint_camera=cam, pc=gaussians, pipe=pipe, bg_color=background, use_trained_exp=False, view_matrix=cam_vm)["render"], 0.0, 1.0)
+                l1_train_with_exp += L.l1_loss(img_with, gt).item()
+                l1_train_no_exp += L.l1_loss(img_no, gt).item()
+        l1_train_with_exp /= len(train_sample)
+        l1_train_no_exp /= len(train_sample)
+        print(f"[ITER {iteration}] Train L1 WITH exposure: {l1_train_with_exp:.4f}   WITHOUT exposure: {l1_train_no_exp:.4f}   gap: {l1_train_no_exp - l1_train_with_exp:.4f}")
+        wandb.log({"diag/train_l1_with_exp": l1_train_with_exp, "diag/train_l1_no_exp": l1_train_no_exp}, step=iteration)
+
 wandb.finish()
