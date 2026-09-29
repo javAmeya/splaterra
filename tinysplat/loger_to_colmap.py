@@ -99,7 +99,34 @@ def main():
                           "already unreliable for these; training on them lets the optimizer 'cheat' by "
                           "growing an opaque Gaussian cluster right at that camera instead of real "
                           "geometry, which then blocks nearby viewpoints too.")
+    ap.add_argument("--source_video", type=str, default=None,
+                     help="Path to the original source video (e.g. inference.mov). When given, training "
+                          "images are extracted from this video at ITS NATIVE resolution instead of "
+                          "reusing LoGeR's own downsampled inference input (typically ~672x378, capped by "
+                          "LoGeR's internal PIXEL_LIMIT -- see demo_viser.py's load_images_from_paths). "
+                          "LoGeR only needs that low resolution for its own pose/pointmap inference; there "
+                          "is no reason to also cap 3DGS's photometric supervision target at the same "
+                          "resolution once poses are known. The shared focal length and principal point "
+                          "are scaled up to match. REQUIRES frame i of the predictions .pt to correspond "
+                          "exactly to frame i of this video (verified for this session's dataset via direct "
+                          "pixel comparison at several indices -- true when the .pt was produced with "
+                          "--start_frame 0 --stride 1, i.e. every frame from the start, which is what the "
+                          "'*_0_-1_1.pt' filename pattern indicates; do not assume it holds for a "
+                          "differently-strided or offset extraction without re-verifying).")
     args = ap.parse_args()
+
+    video_cap = None
+    if args.source_video:
+        import cv2
+        video_cap = cv2.VideoCapture(args.source_video)
+        if not video_cap.isOpened():
+            raise RuntimeError(f"Could not open --source_video {args.source_video}")
+        native_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        native_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"--source_video given: extracting frames at native {native_w}x{native_h} "
+              f"(cv2.CAP_PROP_POS_FRAMES seeking is unreliable on many codecs -- reading "
+              f"sequentially in lockstep with the main per-frame loop below instead, which "
+              f"stays exact as long as the loop visits every prediction index 0..S-1 in order).")
 
     print(f"Loading {args.predictions_pt} ...")
     pred = torch.load(args.predictions_pt, map_location="cpu", weights_only=False)
@@ -131,6 +158,26 @@ def main():
     cx, cy = W / 2.0, H / 2.0
 
     for i in range(S):
+        # Read one video frame per iteration REGARDLESS of whether this
+        # frame ends up kept or dropped below -- this loop already visits
+        # prediction index i in the same order as the video (verified for
+        # this session's dataset), so reading exactly once per iteration,
+        # unconditionally, before any `continue`, is what keeps the video
+        # read position in lockstep with i. Reading conditionally (e.g.
+        # only after the confidence check) would desync the two the moment
+        # any frame gets dropped.
+        native_frame = None
+        if video_cap is not None:
+            ret, native_frame = video_cap.read()
+            if not ret:
+                raise RuntimeError(
+                    f"--source_video ran out of frames at prediction index {i} "
+                    f"(expected at least {S}) -- frame correspondence assumption "
+                    f"(prediction i == video frame i) has broken down; do not "
+                    f"proceed without re-verifying it for this dataset."
+                )
+            native_frame = cv2.cvtColor(native_frame, cv2.COLOR_BGR2RGB)
+
         conf_mask = conf[i] > conf_thresh
         conf_frac = float(conf_mask.mean())
         if conf_frac < args.min_conf_frac:
@@ -166,8 +213,15 @@ def main():
         # identical).
         images_out[image_id] = {"qvec": rotmat2qvec(R), "tvec": t, "camera_id": SHARED_CAMERA_ID, "name": name}
 
+        # img_uint8 (LoGeR's own low-res inference input) is always computed:
+        # it's still used below for the point cloud's per-point RGB (that's
+        # resolution-independent color, not the photometric supervision
+        # target, so no reason to complicate it with native-res pixel
+        # lookups against a conf_mask computed at low res). The SAVED
+        # training image uses native_frame instead, when available.
         img_uint8 = np.clip(images[i] * 255.0, 0, 255).astype(np.uint8)
-        Image.fromarray(img_uint8).save(os.path.join(images_dir, name))
+        saved_image = native_frame if native_frame is not None else img_uint8
+        Image.fromarray(saved_image).save(os.path.join(images_dir, name))
 
         # Depth supervision export: `local`'s Z channel (camera-frame depth,
         # already computed above for the focal fit) is LoGeR's own per-pixel
@@ -205,7 +259,32 @@ def main():
     fx_shared, fy_shared = fx_num / fx_den, fy_num / fy_den
     print(f"Shared focal length (fit across all {len(images_out)} kept frames): fx={fx_shared:.2f} fy={fy_shared:.2f}")
 
-    cameras = {SHARED_CAMERA_ID: {"model": "PINHOLE", "width": W, "height": H, "params": [fx_shared, fy_shared, cx, cy]}}
+    out_w, out_h = W, H
+    if video_cap is not None:
+        # Camera intrinsics scale linearly with image resolution (a pinhole
+        # camera's fx/fy/cx/cy are all in pixel units) -- poses/extrinsics
+        # (R, t) are already resolution-independent and untouched. Aspect
+        # ratio must match between LoGeR's inference resolution and the
+        # native video for a single uniform scale factor to be correct;
+        # verify rather than silently distorting the image if it doesn't.
+        scale_w, scale_h = native_w / W, native_h / H
+        if abs(scale_w - scale_h) / scale_w > 0.01:
+            raise RuntimeError(
+                f"Aspect ratio mismatch between LoGeR's inference resolution "
+                f"({W}x{H}) and --source_video's native resolution "
+                f"({native_w}x{native_h}) -- scale_w={scale_w:.4f} vs "
+                f"scale_h={scale_h:.4f} differ by >1%. A single uniform "
+                f"intrinsics scale factor isn't valid here; check the video "
+                f"hasn't been letterboxed/cropped differently than what "
+                f"LoGeR saw."
+            )
+        fx_shared, fy_shared = fx_shared * scale_w, fy_shared * scale_h
+        cx, cy = cx * scale_w, cy * scale_h
+        out_w, out_h = native_w, native_h
+        print(f"Scaled intrinsics for native {out_w}x{out_h} output: "
+              f"fx={fx_shared:.2f} fy={fy_shared:.2f} cx={cx:.2f} cy={cy:.2f}")
+
+    cameras = {SHARED_CAMERA_ID: {"model": "PINHOLE", "width": out_w, "height": out_h, "params": [fx_shared, fy_shared, cx, cy]}}
 
     all_xyz = np.concatenate(all_xyz, axis=0)
     all_rgb = np.concatenate(all_rgb, axis=0)
@@ -219,6 +298,9 @@ def main():
     write_cameras_binary(cameras, os.path.join(sparse_dir, "cameras.bin"))
     write_images_binary(images_out, os.path.join(sparse_dir, "images.bin"))
     write_points3D_binary(all_xyz, all_rgb, os.path.join(sparse_dir, "points3D.bin"))
+
+    if video_cap is not None:
+        video_cap.release()
 
     print(f"Done. Dataset ready at {args.out_dir} (images/ + sparse/0/).")
     print(f"Point train.py's dataset.source_path at {os.path.abspath(args.out_dir)!r} to train on it.")

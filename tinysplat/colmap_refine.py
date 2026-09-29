@@ -59,8 +59,22 @@ def main():
 
     image_path = os.path.join(args.dataset_dir, "images")
     input_sparse = os.path.join(args.dataset_dir, "sparse", "0")
-    db_path = os.path.join(args.out_dir, "colmap.db")
-    triangulated_path = os.path.join(args.out_dir, "sparse_triangulated")
+    # SQLite's locking/journaling model doesn't work reliably over a
+    # network-mounted filesystem (this pod's /workspace is a FUSE mount,
+    # mfs#us-ks-2.runpod.net) -- hit a real "disk I/O error" mid-extraction
+    # from pycolmap's sqlite3 database when it lived under args.out_dir on
+    # that mount. Keep the SQLite db (and the other COLMAP-internal working
+    # dirs that get read/written repeatedly during matching/triangulation)
+    # on local container disk instead; only the FINAL refined model gets
+    # written to the network-mounted out_dir. Ordinary file reads/writes
+    # (image_path reads, the final recon_tri.write()) are fine over the
+    # network mount -- it's specifically SQLite that isn't.
+    local_work_dir = "/root/colmap_refine_work"
+    if os.path.exists(local_work_dir):
+        shutil.rmtree(local_work_dir)
+    os.makedirs(local_work_dir, exist_ok=True)
+    db_path = os.path.join(local_work_dir, "colmap.db")
+    triangulated_path = os.path.join(local_work_dir, "sparse_triangulated")
     out_sparse = os.path.join(args.out_dir, "sparse", "0")
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -136,6 +150,21 @@ def main():
     print("=" * 60)
     print("4/4  Bundle adjustment (jointly refining poses + points)...")
     ba_options = pycolmap.BundleAdjustmentOptions()
+    # Default options jointly refine camera intrinsics (focal length,
+    # principal point, extra/distortion params) ALONGSIDE poses+points.
+    # With a single SHARED camera model across all 1653 frames (SINGLE mode
+    # above) and initial poses/points seeded from LoGeR rather than a real
+    # COLMAP SfM solve, letting intrinsics move freely as well is
+    # ill-conditioned enough to diverge outright: a real run produced
+    # mean_reprojection_error going from 1.87 (pre-BA) to 4.5e+149 (post-BA)
+    # -- not a slow drift, a numerical blowup. We already trust fx/fy/cx/cy
+    # (passed in via --fx/--fy/--cx/--cy, derived from the known video/sensor
+    # geometry) -- constrain BA to refine ONLY poses and points, matching
+    # this script's actual stated purpose (see module docstring), not
+    # intrinsics recalibration.
+    ba_options.refine_focal_length = False
+    ba_options.refine_principal_point = False
+    ba_options.refine_extra_params = False
     pycolmap.bundle_adjustment(recon_tri, ba_options)
     print("After bundle adjustment:", recon_tri.summary())
 

@@ -317,7 +317,7 @@ def _colmap_params_to_K(model, params):
 # ---------------------------------------------------------------------------
 
 def _estimate_scene_depth_range(points, R_list, t_list, near_pct=0.5, far_pct=99.5,
-                                 near_margin=0.5, far_margin=1.5, sample_size=20000,
+                                 near_margin=0.5, far_margin=3.0, sample_size=20000,
                                  min_near=1e-3):
     """
     gsplat's rasterizer (and tinysplat.camera.Camera's old hardcoded
@@ -331,6 +331,13 @@ def _estimate_scene_depth_range(points, R_list, t_list, near_pct=0.5, far_pct=99
     actual depth distribution of the scene's own points as seen by its own
     cameras, using percentiles (not raw min/max) so a handful of noisy
     outlier points can't blow the range up or clip it down.
+
+    far_margin doubled (1.5 -> 3.0, 2026-09-19) per explicit user
+    observation that long-horizon detail wasn't being captured -- any
+    Gaussian farther than the far plane gets hard-culled from both
+    rendering AND densification gradient accumulation, so a too-tight
+    far plane doesn't just clip the render, it also stops the model from
+    ever growing detail out there in the first place.
     """
     if len(points) > sample_size:
         idx = np.random.choice(len(points), sample_size, replace=False)
@@ -435,7 +442,19 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
 
         image_tensor = torch.from_numpy(np.array(pil_image)).float().permute(2, 0, 1) / 255.0
 # ...
-        image_tensor = image_tensor.to(device)
+        # Deliberately kept on CPU, not moved to `device` here (2026-09-20).
+        # load_colmap_scene loads every training image up front, and this
+        # used to eagerly move all of them onto the GPU -- fine at LoGeR's
+        # own low-res inference resolution (~672x378, ~5GB total for 1653
+        # images) but at a full native 1920x1080 the SAME 1653 images need
+        # ~41GB just to sit there, blowing well past the 24GB RTX 4090
+        # budget before training even starts (confirmed: a fresh OOM in
+        # this exact line, "Tried to allocate 24.00 MiB" against an
+        # already-full 24GB cap, docs/experiment_log.md Run 34). Moved to
+        # GPU lazily instead, one image at a time, right where train.py
+        # actually uses it each iteration (gt_image = viewpoint_cam.
+        # original_image.to(device)) -- at any moment only the one
+        # currently-sampled camera's image needs to be GPU-resident.
 
         invdepthmap, depth_mask, depth_reliable = None, None, False
         depth_stem = os.path.splitext(img.name)[0]
@@ -446,8 +465,11 @@ def load_colmap_scene(dataset_path, images_dir="images", sparse_subdir="sparse/0
             if resolution_scale != 1.0 or invdepth_np.shape != (height, width):
                 invdepth_np = np.array(PILImage.fromarray(invdepth_np).resize((width, height), PILImage.NEAREST))
                 mask_np = np.array(PILImage.fromarray(mask_np).resize((width, height), PILImage.NEAREST))
-            invdepthmap = torch.tensor(invdepth_np, dtype=torch.float32, device=device)
-            depth_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
+            # Same reasoning as original_image above -- kept on CPU, moved to
+            # GPU lazily in train.py's depth-loss block only when depth
+            # supervision is actually active for the current camera.
+            invdepthmap = torch.tensor(invdepth_np, dtype=torch.float32)
+            depth_mask = torch.tensor(mask_np, dtype=torch.float32)
             depth_reliable = bool(mask_np.mean() > 0.01)  # skip frames with essentially no valid depth at all
 
         cam = TinySplatCamera(

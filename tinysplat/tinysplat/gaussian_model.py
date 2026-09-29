@@ -37,27 +37,26 @@ class GaussianModel:
         self.xyz_gradient_accum = None
         self.denom = None
 
+        # Fixed (non-trainable) snapshot of each currently-alive Gaussian's
+        # birth position -- the point it was created from (original point
+        # cloud points at create_from_pcd time; for later clone/split
+        # children, inherited from their parent, since a child spawns near
+        # its parent and "where it should ideally stay anchored" is the same
+        # neighborhood). Used by anchor_loss() to keep the optimized result
+        # tethered to the point-cloud prior instead of letting pure
+        # photometric gradient drift positions arbitrarily far from it.
+        self.xyz_init = None
+        # Single scalar: median distance-to-nearest-neighbor across the
+        # initial point cloud (computed once in create_from_pcd, reusing the
+        # same KNN query already done there for per-Gaussian scale init).
+        # An alternative to `scene.cameras_extent` for the densify/prune size
+        # thresholds -- reflects the actual scale of local point-cloud
+        # detail, not how far apart the cameras were. See params.py's
+        # `use_point_density_extent`.
+        self.median_nn_distance = None
+
         self.optimizer = None
         self.xyz_scheduler_args = None
-
-        # Absolute (extent-independent) size gates for densify/prune -- see
-        # compute_size_thresholds(). None until create_from_pcd/restore sets
-        # point_scale and compute_size_thresholds() is called; the gating
-        # methods fall back to the old extent-relative formula while None, so
-        # nothing breaks for callers (e.g. citysplat) that never call it.
-        self.point_scale = None
-        self.densify_size_threshold = None
-        self.prune_size_threshold = None
-
-        # Position-anchoring bookkeeping (see compute_position_anchor_loss()).
-        # xyz_init holds each Gaussian's target position for the anchor loss;
-        # anchor_mask is True only for Gaussians that trace directly back to
-        # the init point cloud -- Gaussians created later by clone/split are
-        # NOT anchored (they have no point-cloud-prior position of their own
-        # to be pulled toward). Plain tensors, not nn.Parameters: they are a
-        # fixed regression target, never themselves optimized.
-        self.xyz_init = None
-        self.anchor_mask = None
 
         self.pretrained_exposures = None
         self.exposure_optimizer = None
@@ -84,11 +83,10 @@ class GaussianModel:
         dist2_tensor = torch.tensor(mean_dist2, dtype=torch.float32, device=device)
         scales = torch.log(torch.sqrt(dist2_tensor))[..., None].repeat(1, 3)  # (N, 3)
 
-        # Median (not mean, so a handful of sparse/far-away points can't skew
-        # it) local point spacing across the whole init cloud -- the basis for
-        # an absolute, trajectory-independent densify/prune size cap. See
-        # compute_size_thresholds().
-        self.point_scale = float(np.median(np.sqrt(mean_dist2)))
+        # Median (not mean, so a handful of sparse-region outliers can't blow
+        # this up) per-point nearest-neighbor distance -- reuses the same
+        # query above rather than a second KD-tree pass.
+        self.median_nn_distance = float(np.median(np.sqrt(mean_dist2)))
 
         rotations = torch.zeros((n, 4), device=device)
         rotations[:, 0] = 1.0  # identity quaternion (w=1)
@@ -108,12 +106,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros(n, device=device)
         self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
         self.denom = torch.zeros((n, 1), device=device)
-
-        # Every point-cloud-seeded Gaussian is anchored to its own init
-        # position; Gaussians added later via densification are not (see
-        # __init__ comment).
         self.xyz_init = xyz.detach().clone()
-        self.anchor_mask = torch.ones(n, dtype=torch.bool, device=device)
 
     # --- activated properties ---
     @property
@@ -132,7 +125,51 @@ class GaussianModel:
     def get_colors(self):
         # Concatenate DC + rest into the (N, K, 3) shape gsplat expects.
         return torch.cat([self.features_dc, self.features_rest], dim=1)
-    
+
+    def anisotropy_loss(self, ratio_threshold=5.0):
+        """Differentiable soft penalty on needle-shaped Gaussians, meant to
+        be added to the training loss every iteration -- discourages the
+        optimizer from ever growing a Gaussian into a needle shape in the
+        first place, rather than relying solely on pruning to remove them
+        after the fact (docs/experiment_log.md Runs 13-27: every attempt to
+        fix spikes via pruning alone traded them for blur/lost detail when
+        pushed hard enough -- worth trying to prevent the shape from forming
+        rather than only cleaning it up downstream).
+
+        Uses the same largest/second-largest scale-ratio metric as the
+        needle-pruning criterion (see _prune_needles) -- comparing largest
+        to second-largest (not smallest) is what distinguishes genuine
+        needles/spikes (one dominant axis) from legitimate flat/disk-shaped
+        Gaussians (two comparable large axes, common and useful for thin
+        surfaces). Formulated as a hinge/margin penalty -- relu(ratio -
+        threshold) -- so it only accrues loss (and gradient) for Gaussians
+        already past ratio_threshold, leaving the bulk of the population
+        (median ratio ~1.5, p90 ~3.8 on this scene -- docs/experiment_log.md
+        Run 24-26 measurement) completely untouched.
+        """
+        sorted_scales, _ = torch.sort(self.get_scaling, dim=1, descending=True)
+        ratio = sorted_scales[:, 0] / sorted_scales[:, 1].clamp(min=1e-8)
+        return torch.relu(ratio - ratio_threshold).mean()
+
+    def anchor_loss(self):
+        """Differentiable penalty on each Gaussian drifting from its birth
+        position (xyz_init -- the point-cloud point it was created from, or
+        for a clone/split child, inherited from its parent). Meant to be
+        added to the training loss every iteration, alongside anisotropy_loss.
+
+        Depth supervision (train.py) only constrains depth ALONG the current
+        camera's viewing ray -- a Gaussian can drift sideways within the
+        correct depth plane and depth loss won't catch it. This is the more
+        direct version: a full 3D L2 tether back to the prior, independent
+        of which camera is being rendered this iteration. Use when the point
+        cloud prior is trusted and the goal is to keep it strongly
+        influencing the optimized result rather than letting pure
+        photometric gradient relocate Gaussians freely.
+        """
+        if self.xyz_init is None:
+            return torch.zeros((), device=self.xyz.device)
+        return ((self.xyz - self.xyz_init) ** 2).sum(dim=-1).mean()
+
     def create_exposure(self, camera_names, device="cuda"):
         self.exposure_mapping = {name: idx for idx, name in enumerate(camera_names)}
         exposures = torch.eye(3, 4, device=device).unsqueeze(0).repeat(len(camera_names), 1, 1)
@@ -165,6 +202,29 @@ class GaussianModel:
             lr_delay_mult=opt.position_lr_delay_mult,
             max_steps=opt.position_lr_max_steps,
         )
+        # Previously only `xyz` decayed -- f_dc/f_rest/opacity/scaling/
+        # rotation stayed at a flat LR for the entire run, every run this
+        # session. Added per explicit user observation of noisy losses
+        # late in training (2026-09-19, docs/experiment_log.md). Each
+        # decays to 1/10th of its init value (opt.*_lr_final, params.py)
+        # over the full run -- gentler than xyz's 100x decay since these
+        # aren't spatial position deltas. f_rest keeps its existing 1/20
+        # ratio to f_dc throughout the decay, not just at init.
+        self.feature_dc_scheduler_args = get_expon_lr_func(
+            lr_init=opt.feature_lr, lr_final=opt.feature_lr_final, max_steps=opt.iterations,
+        )
+        self.feature_rest_scheduler_args = get_expon_lr_func(
+            lr_init=opt.feature_lr / 20.0, lr_final=opt.feature_lr_final / 20.0, max_steps=opt.iterations,
+        )
+        self.opacity_scheduler_args = get_expon_lr_func(
+            lr_init=opt.opacity_lr, lr_final=opt.opacity_lr_final, max_steps=opt.iterations,
+        )
+        self.scaling_scheduler_args = get_expon_lr_func(
+            lr_init=opt.scaling_lr, lr_final=opt.scaling_lr_final, max_steps=opt.iterations,
+        )
+        self.rotation_scheduler_args = get_expon_lr_func(
+            lr_init=opt.rotation_lr, lr_final=opt.rotation_lr_final, max_steps=opt.iterations,
+        )
         if camera_names is not None:
             self.create_exposure(camera_names, device=device)
             self.exposure_optimizer = torch.optim.Adam([self._exposure], lr=opt.exposure_lr_init)
@@ -176,64 +236,27 @@ class GaussianModel:
                 max_steps=opt.iterations,
             )
 
-    def compute_size_thresholds(self, opt):
-        """Derive absolute densify/prune size caps from the init point
-        cloud's own local spacing (self.point_scale), instead of the stock
-        0.01*extent / 0.1*extent formula that keys off camera-trajectory
-        span. A 100m walkthrough shouldn't get 100x looser size gating than
-        a 1m tabletop orbit just because the camera moved farther -- the
-        physical detail scale you want resolved (bricks, window frames)
-        doesn't change with trajectory length, so the gate shouldn't either.
-
-        opt.densify_size_threshold / opt.prune_size_threshold, if set
-        explicitly, override the auto-estimate. Must be called after
-        create_from_pcd() or restore() (both set self.point_scale) -- call
-        again after restore() too, since point_scale isn't part of the
-        optimizer state.
-        """
-        if self.point_scale is None:
-            raise RuntimeError(
-                "compute_size_thresholds() requires self.point_scale, which "
-                "is set by create_from_pcd() or restore(). Call one of those "
-                "first."
-            )
-
-        self.densify_size_threshold = (
-            opt.densify_size_threshold if opt.densify_size_threshold is not None
-            else opt.densify_size_multiplier * self.point_scale
-        )
-        self.prune_size_threshold = (
-            opt.prune_size_threshold if opt.prune_size_threshold is not None
-            else opt.prune_size_multiplier * self.densify_size_threshold
-        )
-        return self.densify_size_threshold, self.prune_size_threshold
-
-    def compute_position_anchor_loss(self):
-        """Squared distance of each point-cloud-seeded Gaussian from its own
-        init position (mean over anchored points), or 0.0 if none remain
-        (e.g. every original point got pruned). Gaussians created later by
-        clone/split are excluded -- see anchor_mask in __init__.
-
-        Weight the result by a schedule (high early, decayed later) and add
-        to the training loss, so xyz keeps some pull back toward the point
-        cloud prior instead of drifting freely under photometric/depth
-        gradients alone.
-        """
-        if self.anchor_mask is None or not self.anchor_mask.any():
-            return torch.zeros((), device=self.xyz.device)
-        diff = self.xyz[self.anchor_mask] - self.xyz_init[self.anchor_mask]
-        return diff.pow(2).sum(-1).mean()
-
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
     def update_learning_rate(self, iteration):
         lr = None
+        schedulers = {
+            "xyz": self.xyz_scheduler_args,
+            "f_dc": self.feature_dc_scheduler_args,
+            "f_rest": self.feature_rest_scheduler_args,
+            "opacity": self.opacity_scheduler_args,
+            "scaling": self.scaling_scheduler_args,
+            "rotation": self.rotation_scheduler_args,
+        }
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
+            scheduler = schedulers.get(param_group["name"])
+            if scheduler is not None:
+                new_lr = scheduler(iteration)
+                param_group['lr'] = new_lr
+                if param_group["name"] == "xyz":
+                    lr = new_lr
         if self.exposure_optimizer is not None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
@@ -253,20 +276,50 @@ class GaussianModel:
 
         self.denom[update_filter] += 1
         
-    def densify_and_prune(self, max_grad=0.0002, min_opacity=0.005, extent=1.0, max_screen_size=20):
+    def _prune_by_opacity_and_size(self, min_opacity, extent, max_screen_size):
+        # Deliberately excludes the needle-ratio criterion -- see
+        # `_prune_needles` and the Run 14 postmortem (docs/experiment_log.md)
+        # for why the two must run on independent schedules. `max_radii2D`
+        # (screen-space projected size, feeding `big_points_vs`) accumulates
+        # the MAXIMUM ever observed since the last reset of this method (see
+        # `densify_and_prune`/`prune_size_and_opacity` below), so whatever
+        # cadence calls this method also sets how long a single close/grazing
+        # viewpoint can inflate a Gaussian's recorded size before it's
+        # checked -- keep that cadence short (proven safe at the original
+        # densification_interval of 100 across Runs 9-12); do not couple it
+        # to the (much coarser, intentionally slow) needle-check cadence.
+        prune_mask = (self.get_opacity <= min_opacity).squeeze(-1)
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = prune_mask | big_points_vs | big_points_ws
+        self._prune_points(prune_mask)
+        return prune_mask.sum().item()
+
+    def _prune_needles(self, needle_ratio_threshold=25.0):
+        # Sort each Gaussian's 3 scale axes descending and compare the
+        # largest to the SECOND-largest (not the smallest). A legitimate
+        # flat/disk-shaped Gaussian (common and useful -- 3DGS represents
+        # thin surfaces this way) has its two largest axes comparable
+        # (ratio ~1) with only the third axis small; a genuine needle/spike
+        # has ONE dominant axis with the other two both small, so
+        # largest/second-largest is high. Using max/min instead would have
+        # wrongly caught legitimate disks too.
+        sorted_scales, _ = torch.sort(self.get_scaling, dim=1, descending=True)
+        needle_ratio = sorted_scales[:, 0] / sorted_scales[:, 1].clamp(min=1e-8)
+        prune_mask = needle_ratio > needle_ratio_threshold
+        self._prune_points(prune_mask)
+        return prune_mask.sum().item()
+
+    def densify_and_prune(self, max_grad=0.0002, min_opacity=0.005, extent=1.0, max_screen_size=20, needle_ratio_threshold=25.0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self._densify_and_clone(grads, max_grad, extent)
         self._densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity <= min_opacity).squeeze(-1)
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            prune_size_cap = self.prune_size_threshold if self.prune_size_threshold is not None else 0.1 * extent
-            big_points_ws = self.get_scaling.max(dim=1).values > prune_size_cap
-            prune_mask = prune_mask | big_points_vs | big_points_ws
-        self._prune_points(prune_mask)
+        self._prune_by_opacity_and_size(min_opacity, extent, max_screen_size)
+        self._prune_needles(needle_ratio_threshold)
 
         n = self.xyz.shape[0]
         device = self.xyz.device
@@ -275,6 +328,43 @@ class GaussianModel:
         self.max_radii2D = torch.zeros(n, device=device)
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def prune_size_and_opacity(self, min_opacity=0.005, extent=1.0, max_screen_size=20):
+        """Opacity/size pruning only (no needle check, no clone/split) -- for
+        use after opt.densify_until_iter, at a SHORT, frequent cadence (the
+        same densification_interval used during the active densify phase,
+        not the slower late_prune_interval -- see `_prune_by_opacity_and_size`
+        docstring for why: `max_radii2D` accumulates since this method's last
+        call, so a long cadence here lets far more Gaussians pick up a
+        transient large screen-space radius from a single close/grazing
+        camera before being checked, which is what actually caused Run 14's
+        collapse despite the needle-check fix working exactly as intended
+        (see docs/experiment_log.md Run 14).
+
+        Split out from the old combined `prune_only` (which also ran the
+        needle check on this same short cadence) so this proven-safe,
+        already-well-tested criterion isn't accidentally slowed down again
+        by a future change aimed at the needle check alone."""
+        n_pruned = self._prune_by_opacity_and_size(min_opacity, extent, max_screen_size)
+        n = self.xyz.shape[0]
+        device = self.xyz.device
+        self.max_radii2D = torch.zeros(n, device=device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return n_pruned
+
+    def prune_needles(self, needle_ratio_threshold=25.0):
+        """Needle/spike-shape pruning only -- for use after
+        opt.densify_until_iter, at a SLOW cadence (opt.late_prune_interval,
+        e.g. every 3000 iterations, not every 100). Deliberately does NOT
+        touch `max_radii2D` (that's `prune_size_and_opacity`'s job, on its
+        own short cadence) -- keeping these two independent is the fix for
+        Run 14's collapse. needle_ratio_threshold default deliberately
+        raised from an earlier 5.0 to 30.0: 5.0 was validated only against
+        synthetic extreme cases and turned out to be well inside the range
+        of normal, legitimate converged Gaussians. See
+        docs/experiment_log.md Run 13."""
+        return self._prune_needles(needle_ratio_threshold)
 
     # --- internal helpers ---
 
@@ -321,7 +411,6 @@ class GaussianModel:
         self.denom = self.denom[valid]
         self.max_radii2D = self.max_radii2D[valid]
         self.xyz_init = self.xyz_init[valid]
-        self.anchor_mask = self.anchor_mask[valid]
 
     def _cat_tensors_to_optimizer(self, tensors_dict):
         result = {}
@@ -342,7 +431,8 @@ class GaussianModel:
         return result
 
     def _densification_postfix(self, new_xyz, new_scales, new_rotations,
-                                new_opacity, new_features_dc, new_features_rest):
+                                new_opacity, new_features_dc, new_features_rest,
+                                new_xyz_init):
         result = self._cat_tensors_to_optimizer({
             "xyz": new_xyz, "scaling": new_scales, "rotation": new_rotations,
             "opacity": new_opacity, "f_dc": new_features_dc, "f_rest": new_features_rest,
@@ -353,6 +443,9 @@ class GaussianModel:
         self.opacity = result["opacity"]
         self.features_dc = result["f_dc"]
         self.features_rest = result["f_rest"]
+        # Not an optimizer param (fixed buffer, not trainable) -- plain
+        # concat, not routed through _cat_tensors_to_optimizer.
+        self.xyz_init = torch.cat([self.xyz_init, new_xyz_init], dim=0)
 
         n = self.xyz.shape[0]
         device = self.xyz.device
@@ -360,22 +453,9 @@ class GaussianModel:
         self.denom = torch.zeros((n, 1), device=device)
         self.max_radii2D = torch.zeros(n, device=device)
 
-        # New Gaussians from clone/split are not anchored (option (b) from
-        # the design discussion): they have no point-cloud-prior position of
-        # their own, so they're free to move under photometric/depth
-        # gradients alone. xyz_init entries for them are dummy/unused --
-        # anchor_mask=False means compute_position_anchor_loss() never reads
-        # them.
-        n_new = new_xyz.shape[0]
-        self.xyz_init = torch.cat([self.xyz_init, torch.zeros_like(new_xyz)], dim=0)
-        self.anchor_mask = torch.cat(
-            [self.anchor_mask, torch.zeros(n_new, dtype=torch.bool, device=device)], dim=0
-        )
-
     def _densify_and_clone(self, grads, grad_threshold, extent):
         selected = torch.where(grads.squeeze(-1) >= grad_threshold, True, False)
-        size_cap = self.densify_size_threshold if self.densify_size_threshold is not None else 0.01 * extent
-        selected &= self.get_scaling.max(dim=1).values <= size_cap
+        selected &= self.get_scaling.max(dim=1).values <= 0.01 * extent
 
         new_xyz = self.xyz[selected]
         new_scales = self.scales[selected]
@@ -383,9 +463,13 @@ class GaussianModel:
         new_opacity = self.opacity[selected]
         new_features_dc = self.features_dc[selected]
         new_features_rest = self.features_rest[selected]
+        # Clone is a straight duplicate -- inherits its own xyz_init
+        # unchanged, same anchor as the Gaussian it was cloned from.
+        new_xyz_init = self.xyz_init[selected]
 
         self._densification_postfix(new_xyz, new_scales, new_rotations,
-                                     new_opacity, new_features_dc, new_features_rest)
+                                     new_opacity, new_features_dc, new_features_rest,
+                                     new_xyz_init)
 
     def _densify_and_split(self, grads, grad_threshold, extent, n_split=2):
         n_init = self.xyz.shape[0]
@@ -393,23 +477,26 @@ class GaussianModel:
         padded_grad[:grads.shape[0]] = grads.squeeze(-1)
 
         selected = padded_grad >= grad_threshold
-        size_cap = self.densify_size_threshold if self.densify_size_threshold is not None else 0.01 * extent
-        selected &= self.get_scaling.max(dim=1).values > size_cap
+        selected &= self.get_scaling.max(dim=1).values > 0.01 * extent
 
         stds = self.get_scaling[selected].repeat(n_split, 1)
         means = torch.zeros((stds.size(0), 3), device=self.xyz.device)
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self.get_rotation[selected]).repeat(n_split, 1, 1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.xyz[selected].repeat(n_split, 1)
-        
+
         new_scales = torch.log(self.get_scaling[selected].repeat(n_split, 1) / (0.8 * n_split))
         new_rotations = self.rotations[selected].repeat(n_split, 1)
         new_opacity = self.opacity[selected].repeat(n_split, 1)
         new_features_dc = self.features_dc[selected].repeat(n_split, 1, 1)
         new_features_rest = self.features_rest[selected].repeat(n_split, 1, 1)
+        # Split children spawn near the parent -- inherit the parent's
+        # xyz_init (same target neighborhood), repeated per child.
+        new_xyz_init = self.xyz_init[selected].repeat(n_split, 1)
 
         self._densification_postfix(new_xyz, new_scales, new_rotations,
-                                     new_opacity, new_features_dc, new_features_rest)
+                                     new_opacity, new_features_dc, new_features_rest,
+                                     new_xyz_init)
 
         prune_filter = torch.cat((selected, torch.zeros(n_split * selected.sum(), device=self.xyz.device, dtype=bool)))
         self._prune_points(prune_filter)
@@ -430,9 +517,8 @@ class GaussianModel:
             "features_dc": self.features_dc.detach().cpu(),
             "features_rest": self.features_rest.detach().cpu(),
             "active_sh_degree": self.active_sh_degree,
-            "point_scale": self.point_scale,
             "xyz_init": self.xyz_init.detach().cpu() if self.xyz_init is not None else None,
-            "anchor_mask": self.anchor_mask.detach().cpu() if self.anchor_mask is not None else None,
+            "median_nn_distance": self.median_nn_distance,
         }
     def restore(self, state, device="cuda"):
         """
@@ -459,23 +545,14 @@ class GaussianModel:
             state["features_rest"].to(device).requires_grad_(True))
 
         self.active_sh_degree = state["active_sh_degree"]
-        self.point_scale = state.get("point_scale")
+        # Older checkpoints (before anchor_loss/median_nn_distance existed)
+        # won't have these keys -- fall back sanely rather than KeyError.
+        xyz_init = state.get("xyz_init")
+        self.xyz_init = (xyz_init.to(device) if xyz_init is not None
+                          else self.xyz.detach().clone())
+        self.median_nn_distance = state.get("median_nn_distance")
 
         n = self.xyz.shape[0]
         self.max_radii2D = torch.zeros(n, device=device)
         self.xyz_gradient_accum = torch.zeros((n, 1), device=device)
         self.denom = torch.zeros((n, 1), device=device)
-
-        # Checkpoints saved before position anchoring existed won't have
-        # these keys -- fall back to "nothing anchored" rather than crash,
-        # since there's no original-point-cloud provenance to recover here.
-        xyz_init = state.get("xyz_init")
-        anchor_mask = state.get("anchor_mask")
-        if xyz_init is not None and anchor_mask is not None:
-            self.xyz_init = xyz_init.to(device)
-            self.anchor_mask = anchor_mask.to(device)
-        else:
-            print("[gaussian_model] checkpoint has no xyz_init/anchor_mask -- "
-                  "resuming with position anchoring disabled for all Gaussians.")
-            self.xyz_init = torch.zeros_like(self.xyz)
-            self.anchor_mask = torch.zeros(n, dtype=torch.bool, device=device)
