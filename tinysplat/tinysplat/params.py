@@ -5,7 +5,15 @@ class OptimizationParams:
 
     def __init__(self):
 
-        self.iterations = 30000
+        self.iterations = 60000
+
+        # Views averaged per optimizer step via gradient accumulation
+        # (train.py's views_per_step inner loop). Default 1 = every prior
+        # run's exact behavior. >1 directly reduces per-step loss variance
+        # (scales ~1/sqrt(K)) by averaging K independently-sampled views'
+        # gradients before each optimizer.step(), instead of stepping on
+        # one random view's gradient at a time.
+        self.views_per_step = 1
 
         self.lambda_dssim = 0.2
 
@@ -14,74 +22,62 @@ class OptimizationParams:
 
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
-        # Was 0.05 (2x the official 3DGS default of 0.025) -- slowed down so
-        # opacity can't swing a Gaussian to fully opaque (floater) or fully
-        # transparent (spurious prune) as fast, keeping the optimizer closer
-        # to the point-cloud-prior init state for longer.
-        self.opacity_lr = 0.025
+        self.opacity_lr = 0.05
         self.feature_lr = 0.0025
 
-        self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30000
+        # Decays to 1/3 of init -- quiets noisy loss without costing too
+        # much late-run refinement capacity (docs/experiment_log.md, N14-N16).
+        self.scaling_lr_final = self.scaling_lr / 3.0
+        self.rotation_lr_final = self.rotation_lr / 3.0
+        self.opacity_lr_final = self.opacity_lr / 3.0
+        self.feature_lr_final = self.feature_lr / 3.0
 
-        self.densify_until_iter = 15000
+        self.position_lr_delay_mult = 0.01
+        # Tied to `iterations` rather than a separately hardcoded value: this
+        # was previously a fixed 30000 that happened to match `iterations`
+        # (also 30000) by coincidence. Bumping `iterations` alone without
+        # this would leave the xyz LR schedule fully decayed and flat at
+        # position_lr_final for the entire back half of a longer run.
+        self.position_lr_max_steps = self.iterations
+
+        # N5 config: 100% window.
+        self.densify_until_iter = self.iterations
         self.densify_from_iter = 500
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000
-        # Was 0.00008 (~2.5x more aggressive than the official 3DGS default
-        # of 0.0002) -- restored to upstream so densification relies more on
-        # reshaping/coloring existing Gaussians and less on spawning new
-        # geometry, which is what was letting needle/floater-style artifacts
-        # (and unnecessary restructuring away from the point-cloud prior) in.
-        self.densify_grad_threshold=0.0002
-        self.opacity_cull=0.002
+        # Kept above `iterations` so periodic reset never fires -- it causes
+        # "crystal" artifacts on this scene (feedback_opacity_reset_disabled.md).
+        self.opacity_reset_interval = self.iterations + 1
+        # Ruled out as a detail lever, doesn't change final population
+        # (docs/experiment_log.md, Runs 29-31) -- kept at the stable default.
+        self.densify_grad_threshold=0.00008
+        # Tuned across many runs, see docs/experiment_log.md (Runs 18-28).
+        self.opacity_cull=0.0045
 
-        # --- scale-invariant size gating ---
-        # The stock clone/split/prune size gates (0.01*extent / 0.1*extent) key
-        # off scene.cameras_extent, i.e. camera-trajectory span. That's fine for
-        # an orbit around a small object, but for a long walkthrough the same
-        # relative thresholds balloon with trajectory length even though the
-        # actual detail scale you want resolved (bricks, window frames) doesn't
-        # change. Setting these to None (default) makes GaussianModel derive an
-        # absolute size cap from the init point cloud's own local spacing
-        # instead (see GaussianModel.compute_size_thresholds) -- pass explicit
-        # values here to override that auto-estimate.
-        self.densify_size_threshold = None
-        self.prune_size_threshold = None
-        # Were 20.0 / 10.0 (prune cap = 200x median spacing). LoGeR's point
-        # cloud is a per-pixel DENSE reconstruction, not COLMAP's sparse
-        # feature-matched cloud -- its median nearest-neighbor spacing is far
-        # finer than the actual surface/feature scale a Gaussian should be
-        # allowed to grow to. At the old multipliers this was pruning
-        # legitimate large flat-surface Gaussians as "too big" once they grew
-        # to efficiently cover e.g. a wall, causing progressive sparsification
-        # over training. Loosened ~6x as a starting point -- retune from this
-        # run's `densify/num_gaussians_after` wandb curve (should stop
-        # trending down late in training) rather than trusting these blindly.
-        self.densify_size_multiplier = 60.0   # x median init-point spacing
-        self.prune_size_multiplier = 20.0     # x densify_size_threshold
+        # Independent of opacity_reset_interval so size-based pruning stays
+        # on even with periodic reset disabled above.
+        self.size_prune_from_iter = 3000
 
-        # --- position anchoring ---
-        # Extra loss term pulling each point-cloud-seeded Gaussian's xyz back
-        # toward its own init position (see
-        # GaussianModel.compute_position_anchor_loss()), weighted by an
-        # expon_lr_func schedule (same shape as depth_l1_weight below) that
-        # starts high and decays toward the final value over `iterations`.
-        # Goal: let RGB/SSIM/depth losses drive appearance (color, opacity,
-        # scale, rotation) while xyz itself stays close to the trusted prior,
-        # instead of being free to drift wherever photometric gradient pulls
-        # it. Does NOT apply to Gaussians created later by clone/split (no
-        # prior position of their own to anchor to). Starting weights --
-        # retune by comparing train/position_anchor_loss against
-        # train/l1_loss in wandb.
-        self.position_anchor_weight_init = 1.0
-        self.position_anchor_weight_final = 0.0
+        # Late-training pruning (past densify_until_iter) abandoned --
+        # always collapsed the population. See feedback_no_late_training_pruning.md.
 
+        # N5 config: on (see docs/depth_supervision_method.md).
         self.depth_l1_weight_init = 1.0
-        # Was 0.01 -- raised so late-training optimization stays somewhat
-        # anchored to LoGeR's own depth prior instead of relying on RGB loss
-        # alone once depth supervision has nearly decayed away.
-        self.depth_l1_weight_final = 0.05
+        self.depth_l1_weight_final = 0.01
+
+        # Needle-shape penalty, see gaussian_model.py's anisotropy_loss.
+        # N5 config: off (see docs/anisotropy_loss_method.md).
+        self.anisotropy_loss_weight = 0.0
+        self.anisotropy_ratio_threshold = 5.0
+
+        # 3D tether to the point-cloud prior, see gaussian_model.py's anchor_loss.
+        # N5 config: weight=1.0 (see docs/anchor_loss_method.md).
+        self.anchor_loss_weight = 1.0
+
+        # Alternative densify/prune extent source, see
+        # docs/point_density_extent_method.md -- tried once (N4), over-pruned
+        # badly, off since.
+        self.use_point_density_extent = False
+        self.point_density_extent_scale = 70.0
 
         self.random_background = False
         

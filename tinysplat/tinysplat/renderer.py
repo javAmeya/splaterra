@@ -1,10 +1,15 @@
 import gsplat
-import torch 
-def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False):
+import torch
+def render(viewpoint_camera, pc, pipe, bg_color, use_trained_exp=False, view_matrix=None):
+    # view_matrix override: lets a caller (e.g. PoseCorrection) substitute a
+    # differentiable, per-view-corrected pose in place of the camera's own
+    # fixed one, so pose-refinement gradients flow through the same
+    # rasterization call the Gaussians are optimized against.
+    vm = view_matrix if view_matrix is not None else viewpoint_camera.view_matrix
     render_colors, alpha, meta = gsplat.rasterization(
         means=pc.xyz, quats=pc.get_rotation, scales=pc.get_scaling,
         opacities=pc.get_opacity.squeeze(-1), colors=pc.get_colors,
-        viewmats=viewpoint_camera.view_matrix[None], Ks=viewpoint_camera.K[None],
+        viewmats=vm[None], Ks=viewpoint_camera.K[None],
         width=viewpoint_camera.width, height=viewpoint_camera.height,
         backgrounds=bg_color[None], sh_degree=pc.active_sh_degree,
         near_plane=viewpoint_camera.znear, far_plane=viewpoint_camera.zfar,
