@@ -5,14 +5,14 @@ interactive 3D environment by estimating camera poses and geometry with [LoGeR](
 
  
 
-We are optimizing 3D Gaussian Splatting for Large scenes. Wile standard 3DGS pipelines use COLMAP to obtain a sparse point cloud for Gaussian initialisation, COLMAP fails to provide accurate structural details over long, winding paths.
-Splattera is builds 3DGS on top of LoGeR to optimise large scale reconstruction. LoGeR provides a dense point cloud with great structural detail directly from raw video frames in a single forward pass. 3DGS achieves photorealistic rendering of the scene.
+We are optimizing 3D Gaussian Splatting for Large scenes. While standard 3DGS pipelines use COLMAP to obtain a sparse point cloud for Gaussian initialisation, COLMAP fails to provide accurate structural details over long, winding paths.
+Splaterra builds 3DGS on top of LoGeR to optimise large scale quality reconstruction. LoGeR provides a dense point cloud with great structural detail directly from raw video frames, in a single forward pass. 3DGS achieves photorealistic rendering of the scene.
 <img src="images/vjti.png" alt="vjti" width="700">  
 
 
 ## Installation
 
-Splattera supports the 3DGS training pipeline
+Splaterra supports the 3DGS training pipeline
 
 ## SETUP
 
@@ -64,7 +64,7 @@ python train.py
 ```
 ## Diagnostics
 
-- [`diagnostic_reproject.py`](diagnostic_reproject.py) — Running this file will project the LoGeR 3D point cloud onto a selected training image using the camera’s pose and intrinsics (K matrix).
+- [`diagnostic_reproject.py`](diagnostic_reproject.py) - Running this file will project the LoGeR 3D point cloud onto a selected training image using the camera’s pose and intrinsics (K matrix).
 It will then overlay the projected points on the real image to check whether the camera calibration, pose, and geometry are correctly aligned.
 ```bash
 python diagnostic_reproject.py \
@@ -74,12 +74,12 @@ python diagnostic_reproject.py \
     --out <OUTPUT_OVERLAY.png>
   ```
   
-- [`demo_viser.py`](demo_viser.py) —  Runs LoGeR on your video and opens an interactive 3D viewer, where you can see the  whole reconstructed scene.
+- [`demo_viser.py`](demo_viser.py) - Runs LoGeR on your video and opens an interactive 3D viewer, where you can see the  whole reconstructed scene.
 
 ## Conversion to ply 
 
 
-- [`convertply.sh`](convertply.sh) — convert .pth output to .ply file.
+- [`convertply.sh`](convertply.sh) - convert .pth output to .ply file.
  
  ```bash 
  convertply.sh `iteration`.pth
